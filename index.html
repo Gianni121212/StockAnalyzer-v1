@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>股票分析工具</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #f8f9fa;
+        }
+        .container {
+            max-width: 800px;
+            margin-top: 50px;
+        }
+        .card {
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .card-header {
+            background-color: #343a40;
+            color: white;
+        }
+        .btn-primary {
+            background-color: #343a40;
+            border-color: #343a40;
+        }
+        .btn-primary:hover {
+            background-color: #212529;
+            border-color: #212529;
+        }
+        #loading {
+            display: none;
+            text-align: center;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="text-center mb-0">股票分析工具</h2>
+            </div>
+            <div class="card-body">
+                <form id="analysisForm" method="post" action="/analyze">
+                    <div class="mb-3">
+                        <label for="ticker" class="form-label">股票代碼</label>
+                        <input type="text" class="form-control" id="ticker" name="ticker" required placeholder="例如: 2330 或 AAPL">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="market" class="form-label">市場</label>
+                        <select class="form-select" id="market" name="market">
+                            <option value="TW" selected>台灣</option>
+                            <option value="US">美國</option>
+                        </select>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="period" class="form-label">分析期間</label>
+                        <select class="form-select" id="period" name="period">
+                            <option value="1y">一年</option>
+                            <option value="2y">兩年</option>
+                            <option value="3y" selected>三年</option>
+                            <option value="5y">五年</option>
+                            <option value="max">最大可用期間</option>
+                        </select>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="days" class="form-label">分析交易日數量</label>
+                        <input type="number" class="form-control" id="days" name="days" value="180" min="30" max="1000">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="api_key" class="form-label">Gemini API 金鑰</label>
+                        <input type="text" class="form-control" id="api_key" name="api_key" required>
+                        <div class="form-text">請輸入有效的 Gemini API 金鑰以使用 AI 分析功能</div>
+                    </div>
+                    
+                    <div class="text-center">
+                        <button type="submit" class="btn btn-primary">開始分析</button>
+                    </div>
+                </form>
+                
+                <div id="loading">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">載入中...</span>
+                    </div>
+                    <p class="mt-2">正在分析中，請稍候...</p>
+                </div>
+                
+                <div id="error" class="alert alert-danger mt-3" style="display: none;"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        document.getElementById('analysisForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            // 顯示載入中
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('error').style.display = 'none';
+            
+            // 使用 AJAX 提交表單
+            const formData = new FormData(this);
+            
+            fetch('/analyze', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    document.getElementById('error').textContent = data.error;
+                    document.getElementById('error').style.display = 'block';
+                    document.getElementById('loading').style.display = 'none';
+                } else if (data.redirect) {
+                    window.location.href = data.redirect;
+                }
+            })
+            .catch(error => {
+                document.getElementById('error').textContent = '發生錯誤，請稍後再試';
+                document.getElementById('error').style.display = 'block';
+                document.getElementById('loading').style.display = 'none';
+                console.error('Error:', error);
+            });
+        });
+    </script>
+</body>
+</html>
