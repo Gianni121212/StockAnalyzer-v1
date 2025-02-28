@@ -1,36 +1,25 @@
-<!DOCTYPE html>
+<!DOCTYPE html> 
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>股票分析工具</title>
   <!-- 載入 Bootstrap CSS -->
-  <link
-    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css"
-    rel="stylesheet"
-  />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet" />
   <!-- 載入 Google Fonts: Orbitron 與 Roboto -->
-  <link
-    href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Roboto:wght@400;700&display=swap"
-    rel="stylesheet"
-  />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Roboto:wght@400;700&display=swap" rel="stylesheet" />
   <style>
     /* Reset */
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    html,
-    body {
-      height: 100%;
-    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; font-size: 14px; }
     body {
       background: #000;
       font-family: "Roboto", sans-serif;
       color: #fff;
       overflow-x: hidden;
+      transition: background 0.5s, color 0.5s;
     }
+
     /* 動態霓虹背景 */
     .neon-background {
       position: fixed;
@@ -38,25 +27,20 @@
       left: 0;
       width: 100%;
       height: 100%;
-      background: linear-gradient(45deg, #ff0099, #493240, #00ff99, #0033ff);
-      background-size: 400% 400%;
-      animation: neonBG 15s ease infinite;
+      background: linear-gradient(45deg, #ff0099, #ff3300, #00ff99, #0033ff, #9900ff);
+      background-size: 600% 600%;
+      animation: neonBG 20s ease infinite;
       z-index: -2;
       filter: blur(8px);
       opacity: 0.7;
     }
     @keyframes neonBG {
-      0% {
-        background-position: 0% 50%;
-      }
-      50% {
-        background-position: 100% 50%;
-      }
-      100% {
-        background-position: 0% 50%;
-      }
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
     }
-    /* 主內容容器：左右並列 */
+
+    /* 主內容容器 */
     .content-wrapper {
       display: flex;
       flex-direction: row;
@@ -68,74 +52,39 @@
       position: relative;
       z-index: 1;
     }
-    /* 霓虹卡片 (左側) */
+
+    /* 霓虹卡片 */
     .neon-card {
-      position: relative;
       background: rgba(0, 0, 0, 0.8);
       border: 2px solid #0ff;
       border-radius: 20px;
       padding: 40px;
       width: 100%;
-      max-width: 500px;
+      max-width: 500px; /* 調小寬度 */
       box-shadow: 0 0 20px #0ff, 0 0 40px #f0f, 0 0 60px #0ff;
-      animation: pulse 2s infinite;
+      transition: transform 0.3s, box-shadow 0.3s;
     }
-    @keyframes pulse {
-      0%,
-      100% {
-        box-shadow: 0 0 20px #0ff, 0 0 40px #f0f, 0 0 60px #0ff;
-      }
-      50% {
-        box-shadow: 0 0 30px #0ff, 0 0 50px #f0f, 0 0 70px #0ff;
-      }
+    .neon-card:hover {
+      transform: scale(1.02);
+      box-shadow: 0 0 30px #f0f, 0 0 60px #f0f, 0 0 90px #f0f;
     }
-    .neon-card::before {
-      content: "";
-      position: absolute;
-      top: -50%;
-      left: -50%;
-      width: 200%;
-      height: 200%;
-      background: conic-gradient(
-        from 90deg at 50% 50%,
-        rgba(255, 255, 255, 0.15),
-        transparent,
-        rgba(255, 255, 255, 0.15)
-      );
-      animation: rotate 6s linear infinite;
-      z-index: -1;
-    }
-    @keyframes rotate {
-      from {
-        transform: rotate(0deg);
-      }
-      to {
-        transform: rotate(360deg);
-      }
-    }
+
+    /* 動態標題效果 */
     .neon-card h2 {
       font-family: "Orbitron", sans-serif;
-      font-size: 2.5rem;
+      font-size: 2rem; /* 調小標題字體 */
       text-align: center;
       margin-bottom: 20px;
-      position: relative;
       color: #fff;
-      animation: glitch 1s infinite;
+      animation: color-change 3s infinite;
     }
-    @keyframes glitch {
-      0% { clip: rect(42px, 9999px, 44px, 0); }
-      10% { clip: rect(12px, 9999px, 82px, 0); }
-      20% { clip: rect(52px, 9999px, 32px, 0); }
-      30% { clip: rect(62px, 9999px, 72px, 0); }
-      40% { clip: rect(32px, 9999px, 22px, 0); }
-      50% { clip: rect(42px, 9999px, 52px, 0); }
-      60% { clip: rect(12px, 9999px, 82px, 0); }
-      70% { clip: rect(52px, 9999px, 32px, 0); }
-      80% { clip: rect(62px, 9999px, 72px, 0); }
-      90% { clip: rect(32px, 9999px, 22px, 0); }
-      100% { clip: rect(42px, 9999px, 44px, 0); }
+    @keyframes color-change {
+      0% { color: #fff; }
+      50% { color: #0ff; }
+      100% { color: #fff; }
     }
-    /* 霓虹風格表單 */
+
+    /* 表單樣式 */
     .rich-form {
       background: rgba(20, 20, 20, 0.9);
       border: 1px solid #0ff;
@@ -146,61 +95,30 @@
       flex-direction: column;
       gap: 15px;
     }
-    .rich-form p {
-      font-size: 1.2rem;
-      font-weight: 700;
-      text-align: center;
-      color: #0ff;
-    }
-    .rich-form p span {
-      font-size: 0.9rem;
-      color: #f0f;
-    }
-    .rich-form label {
-      font-size: 1rem;
-      font-weight: 600;
-      color: #fff;
-    }
-    .rich-form input,
-    .rich-form select {
+    .rich-form input, .rich-form select {
       width: 100%;
-      height: 45px;
-      padding: 10px;
+      height: 40px;  /* 稍微縮小輸入框 */
+      padding: 8px;
       border: 1px solid #0ff;
       border-radius: 5px;
       background: #111;
       color: #fff;
-      font-size: 1rem;
+      font-size: 0.9rem;
+      transition: border-color 0.3s, box-shadow 0.3s;
     }
-    .rich-form input:focus,
-    .rich-form select:focus {
-      outline: none;
+    .rich-form input:focus, .rich-form select:focus {
       border-color: #f0f;
       box-shadow: 0 0 10px #f0f;
-    }
-    .separator {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 10px;
-    }
-    .separator div {
-      flex: 1;
-      height: 1px;
-      background-color: #0ff;
-    }
-    .separator span {
-      font-size: 0.9rem;
-      color: #0ff;
+      outline: none;
     }
     .rich-form button {
       width: 100%;
-      height: 50px;
+      height: 45px;  /* 調小按鈕高度 */
       border: none;
       border-radius: 5px;
       background: linear-gradient(45deg, #0ff, #f0f);
       color: #000;
-      font-size: 1.2rem;
+      font-size: 1rem;
       font-weight: 700;
       cursor: pointer;
       transition: transform 0.2s, box-shadow 0.2s;
@@ -209,56 +127,173 @@
       transform: translateY(-3px);
       box-shadow: 0 0 15px #f0f;
     }
-    /* 熱門股選單 (右側) */
+    .rich-form button:active {
+      transform: scale(0.95);
+    }
+
+    /* 自訂勾選框樣式 */
+    .rich-form input[type="checkbox"] {
+      appearance: none;
+      width: 16px;
+      height: 16px;
+      border: 2px solid #0ff;
+      border-radius: 3px;
+      background: #111;
+      cursor: pointer;
+      transition: background 0.3s ease, border-color 0.3s ease;
+      vertical-align: middle;
+    }
+    .rich-form input[type="checkbox"]:checked {
+      background: #0ff;
+      border-color: #f0f;
+    }
+    .rich-form input[type="checkbox"]:checked::after {
+      content: '✓';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: #000;
+      font-size: 10px;
+      font-weight: bold;
+    }
+    .rich-form label {
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: #fff;
+      margin-left: 8px;
+      vertical-align: middle;
+    }
+    .ma-lines-container {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    /* 熱門股選單 */
     .hot-stocks {
       background: rgba(20, 20, 20, 0.9);
       border: 1px solid #0ff;
       border-radius: 10px;
       padding: 20px;
-      width: 280px;
+      width: 500px;  /* 加寬，避免 META 文字換行 */
       max-height: 500px;
-      overflow-y: auto;
       box-shadow: 0 0 15px #0ff;
     }
     .hot-stocks h3 {
-      font-family: "Orbitron", sans-serif;
-      font-size: 1.8rem;
-      text-align: center;
       margin-bottom: 15px;
-      color: #0ff;
+      text-align: center;
+      font-size: 1.2rem;
     }
-    .hot-stocks ul {
+    /* 兩欄版型 */
+    .stock-groups {
+      display: flex;
+      flex-direction: row;
+      gap: 20px;
+    }
+    .stock-group {
+      flex: 1;
+    }
+    .stock-group h4 {
+      margin-bottom: 10px;
+      font-size: 1rem;
+      border-bottom: 1px solid #0ff;
+      padding-bottom: 5px;
+    }
+    .stock-group ul {
       list-style: none;
       padding: 0;
+      font-size: 0.9rem;
     }
-    .hot-stocks li {
-      font-size: 1rem;
-      font-weight: 600;
-      color: #fff;
-      padding: 8px 10px;
+    .stock-group li {
+      padding: 6px 8px;
       border-bottom: 1px solid #0ff;
-      transition: background 0.3s;
+      transition: background 0.3s, transform 0.1s;
       cursor: pointer;
     }
-    .hot-stocks li:hover {
+    .stock-group li:hover {
       background: rgba(0, 255, 255, 0.2);
     }
-    /* 載入動畫區 */
+    .stock-group li:active {
+      background: rgba(255, 0, 255, 0.3);
+      transform: scale(0.98);
+    }
+
+    /* 熱門股漲跌幅樣式 */
+    .stock-change {
+      font-size: 0.8rem;
+      font-weight: bold;
+      margin-left: 8px;
+      opacity: 0;
+      transition: opacity 0.5s ease-in;
+    }
+    .stock-change.show {
+      opacity: 1;
+    }
+    .stock-change.neon-green {
+      color: #0f0;
+      text-shadow: 0 0 5px #0f0, 0 0 10px #0f0, 0 0 15px #0f0;
+    }
+    .stock-change.neon-red {
+      color: #f00;
+      text-shadow: 0 0 5px #f00, 0 0 10px #f00, 0 0 15px #f00;
+    }
+
+    /* 載入動畫 */
     #loading {
       display: none;
       text-align: center;
       margin-top: 20px;
     }
-    #loading .spinner-border {
-      width: 3rem;
-      height: 3rem;
+    .neon-spinner {
+      width: 40px;
+      height: 40px;
+      border: 4px solid #0ff;
+      border-top: 4px solid transparent;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin: 0 auto;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+
+    /* 小問號資訊按鈕 */
+    #info-toggle {
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      z-index: 10;
+      font-size: 0.9rem;
+      border-radius: 50%;
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      background-color: #17a2b8;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+    }
+
+    /* 調整 Modal 文字顯示 (預設是黑底白字，避免看不到內容) */
+    .modal-content {
+      background-color: #222;
+      color: #fff;
+    }
+    .modal-header .btn-close {
+      filter: invert(1); /* 讓關閉按鈕可見 */
     }
   </style>
 </head>
 <body>
   <!-- 動態霓虹背景 -->
   <div class="neon-background"></div>
-  <!-- 主內容容器：左右並列 -->
+  
+  <!-- 小問號資訊按鈕 -->
+  <button id="info-toggle">?</button>
+  
+  <!-- 主內容容器 -->
   <div class="content-wrapper">
     <!-- 左側：霓虹卡片與表單 -->
     <div class="neon-card">
@@ -266,97 +301,112 @@
       <form id="analysisForm" class="rich-form" method="post" action="/analyze">
         <p>請輸入股票資訊 <span>展開你的投資之旅</span></p>
         <label for="ticker">股票代碼</label>
-        <input
-          type="text"
-          id="ticker"
-          name="ticker"
-          required
-          placeholder="例如: 2330 或 AAPL"
-        />
+        <input type="text" id="ticker" name="ticker" required placeholder="例如: 2330 或 AAPL" aria-label="股票代碼" />
         <label for="market">市場</label>
-        <select id="market" name="market">
+        <select id="market" name="market" aria-label="選擇市場">
           <option value="TW" selected>台灣</option>
           <option value="US">美國</option>
         </select>
-       
         <label for="days">分析交易日數量</label>
-        <input
-          type="number"
-          id="days"
-          name="days"
-          value="180"
-          min="30"
-          max="1000"
-        />
-        <div class="separator">
-          <div></div>
-          <span></span>
-          <div></div>
+        <input type="number" id="days" name="days" value="180" min="30" max="1000" aria-label="分析交易日數量" />
+        <label>選擇要顯示的均線</label>
+        <div class="ma-lines-container">
+          <label><input type="checkbox" name="ma_lines" value="MA5" checked> MA5 (5日均線)</label>
+          <label><input type="checkbox" name="ma_lines" value="MA20" checked> MA20 (20日均線)</label>
+          <label><input type="checkbox" name="ma_lines" value="MA120"> MA120 (半年線)</label>
+          <label><input type="checkbox" name="ma_lines" value="MA240"> MA240 (年線)</label>
         </div>
-        <button type="submit">開始分析</button>
+        <button type="submit" aria-label="開始分析">開始分析</button>
       </form>
       <div id="loading">
-        <div class="spinner-border text-light" role="status">
-          <span class="visually-hidden">載入中...</span>
-        </div>
+        <div class="neon-spinner"></div>
         <p style="color: #fff; margin-top: 10px;">正在分析中，請稍候...</p>
       </div>
-      <div
-        id="error"
-        class="alert alert-danger mt-3"
-        style="display: none;"
-      ></div>
+      <div id="error" class="alert alert-danger mt-3" style="display: none;"></div>
+      <div id="success-msg" style="color: #0ff; margin-top: 10px; display: none;">分析請求已提交，請稍候...</div>
     </div>
-    <!-- 右側：熱門股選單 -->
+    <!-- 右側：熱門股選單（左右分欄：左側台灣股、右側美國股） -->
     <div class="hot-stocks">
       <h3>熱門股選單</h3>
-      <ul>
-        <!-- 為每個熱門股加入 data-ticker 與 data-market 屬性 -->
-        <li data-ticker="2330" data-market="TW">2330 台積電</li>
-        <li data-ticker="2317" data-market="TW">2317 鴻海</li>
-        <li data-ticker="2454" data-market="TW">2454 聯發科</li>
-        <li data-ticker="AAPL" data-market="US">AAPL Apple</li>
-        <li data-ticker="NVDA" data-market="US">NVDA Nvidia</li>
-        <li data-ticker="GOOG" data-market="US">GOOG Google</li>
-        <li data-ticker="MSFT" data-market="US">MSFT Microsoft</li>
-        <li data-ticker="TSLA" data-market="US">TSLA Tesla</li>
-      </ul>
+      <div class="stock-groups">
+        <div class="stock-group">
+          <h4>台股</h4>
+          <ul>
+            <li data-ticker="2330.TW" data-market="TW">2330 台積電 <span class="stock-change" id="change-2330"></span></li>
+            <li data-ticker="2317.TW" data-market="TW">2317 鴻海 <span class="stock-change" id="change-2317"></span></li>
+            <li data-ticker="2454.TW" data-market="TW">2454 聯發科 <span class="stock-change" id="change-2454"></span></li>
+          </ul>
+        </div>
+        <div class="stock-group">
+          <h4>美股</h4>
+          <ul>
+            <li data-ticker="AAPL" data-market="US">AAPL Apple <span class="stock-change" id="change-AAPL"></span></li>
+            <li data-ticker="NVDA" data-market="US">NVDA Nvidia <span class="stock-change" id="change-NVDA"></span></li>
+            <li data-ticker="GOOG" data-market="US">GOOG Google <span class="stock-change" id="change-GOOG"></span></li>
+            <li data-ticker="MSFT" data-market="US">MSFT Microsoft <span class="stock-change" id="change-MSFT"></span></li>
+            <li data-ticker="TSLA" data-market="US">TSLA Tesla <span class="stock-change" id="change-TSLA"></span></li>
+            <li data-ticker="AMZN" data-market="US">AMZN Amazon <span class="stock-change" id="change-AMZN"></span></li>
+            <li data-ticker="META" data-market="US">META Meta Platforms <span class="stock-change" id="change-META"></span></li>
+          </ul>
+        </div>
+      </div>
     </div>
   </div>
+
+  <!-- 資訊彈窗 Modal -->
+  <div class="modal fade" id="infoModal" tabindex="-1" aria-labelledby="infoModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="infoModalLabel">系統資訊</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="關閉"></button>
+        </div>
+        <div class="modal-body">
+          這是一個股票分析工具，能夠取得台灣與美國股市資料，
+          並進行技術分析、視覺化展示與新聞情緒分析。
+          請輸入股票代碼及選擇市場開始分析。
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">關閉</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
   <script>
-    // 監聽表單送出事件（保持原有邏輯）
-    document
-      .getElementById("analysisForm")
-      .addEventListener("submit", function (e) {
-        e.preventDefault();
-        document.getElementById("loading").style.display = "block";
-        document.getElementById("error").style.display = "none";
-        const formData = new FormData(this);
-        fetch("/analyze", {
-          method: "POST",
-          body: formData,
-        })
-          .then((response) => response.json())
-          .then((data) => {
-            if (data.error) {
-              document.getElementById("error").textContent = data.error;
-              document.getElementById("error").style.display = "block";
-              document.getElementById("loading").style.display = "none";
-            } else if (data.redirect) {
-              window.location.href = data.redirect;
-            }
-          })
-          .catch((error) => {
-            document.getElementById("error").textContent =
-              "發生錯誤，請稍後再試";
+    // 表單提交事件
+    document.getElementById("analysisForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      document.getElementById("loading").style.display = "block";
+      document.getElementById("error").style.display = "none";
+      document.getElementById("success-msg").style.display = "none";
+      const formData = new FormData(this);
+      fetch("/analyze", {
+        method: "POST",
+        body: formData,
+      })
+        .then((response) => response.json())
+        .then((data) => {
+          document.getElementById("loading").style.display = "none";
+          if (data.error) {
+            document.getElementById("error").textContent = data.error;
             document.getElementById("error").style.display = "block";
-            document.getElementById("loading").style.display = "none";
-            console.error("Error:", error);
-          });
-      });
+          } else {
+            document.getElementById("success-msg").style.display = "block";
+            setTimeout(() => document.getElementById("success-msg").style.display = "none", 3000);
+            if (data.redirect) window.location.href = data.redirect;
+          }
+        })
+        .catch((error) => {
+          document.getElementById("loading").style.display = "none";
+          document.getElementById("error").textContent = "發生錯誤，請稍後再試";
+          document.getElementById("error").style.display = "block";
+          console.error("Error:", error);
+        });
+    });
 
-    // 監聽熱門股選單點擊事件，自動填入股票代碼與市場
+    // 熱門股選單點擊事件
     document.querySelectorAll(".hot-stocks li").forEach((item) => {
       item.addEventListener("click", () => {
         const ticker = item.getAttribute("data-ticker");
@@ -364,6 +414,43 @@
         document.getElementById("ticker").value = ticker;
         document.getElementById("market").value = market;
       });
+    });
+
+    // 熱門股漲跌幅動態更新
+    document.addEventListener('DOMContentLoaded', () => {
+      const stockItems = document.querySelectorAll('.hot-stocks li');
+      stockItems.forEach(item => {
+        const ticker = item.getAttribute('data-ticker');
+        const changeSpan = item.querySelector('.stock-change');
+        fetch(`/get_stock_change/${ticker}`)
+          .then(response => response.json())
+          .then(data => {
+            if (data.error) {
+              changeSpan.textContent = 'N/A';
+              changeSpan.style.color = '#fff';
+            } else {
+              const change = data.change.toFixed(2);
+              changeSpan.textContent = `${change > 0 ? '+' : ''}${change}%`;
+              if (change > 0) {
+                changeSpan.classList.add('neon-green');
+              } else if (change < 0) {
+                changeSpan.classList.add('neon-red');
+              }
+              changeSpan.classList.add('show');
+            }
+          })
+          .catch(error => {
+            console.error('Error:', error);
+            changeSpan.textContent = 'N/A';
+            changeSpan.style.color = '#fff';
+          });
+      });
+    });
+
+    // 小問號資訊按鈕點擊事件，開啟 Bootstrap modal
+    document.getElementById("info-toggle").addEventListener("click", () => {
+      const infoModal = new bootstrap.Modal(document.getElementById('infoModal'));
+      infoModal.show();
     });
   </script>
 </body>
