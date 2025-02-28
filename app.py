@@ -52,7 +52,8 @@ class StockAnalyzer:
         self.roe = None
 
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-pro")
+        # 使用穩定版本
+        self.model = genai.GenerativeModel("models/gemini-1.5-pro-latest")
 
         # 初始化情緒分析器（使用 FinBERT）
         self.sentiment_analyzer = pipeline('sentiment-analysis', model='yiyanghkust/finbert-tone')
