@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, session, redirect
+from flask import Flask, render_template, request, jsonify, session, redirect  
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -16,14 +16,13 @@ import feedparser
 import urllib.parse
 from transformers import pipeline
 import logging
+import pandas_ta as ta
 
 warnings.filterwarnings('ignore')
 
-# Configure logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s:%(message)s')
 
-# Ensure necessary directories exist (保留 charts 目錄，data 目錄若僅用於 JSON 可保留)
 for path in ['static/charts', 'static/data']:
     os.makedirs(path, exist_ok=True)
 
@@ -47,6 +46,12 @@ class StockAnalyzer:
         self.profit_margins = None
         self.eps = None
         self.roe = None
+        # 新增財務報表和計算指標的屬性
+        self.financials_head = None
+        self.balance_sheet_head = None
+        self.cashflow_head = None
+        self.net_profit_margin_str = None
+        self.current_ratio_str = None
 
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel("models/gemini-2.0-flash")
@@ -77,16 +82,43 @@ class StockAnalyzer:
             self.forward_pe = info.get('forwardPE', 'N/A')
             self.profit_margins = info.get('profitMargins', 'N/A')
             self.eps = info.get('trailingEps', 'N/A')
-
+            annual_financials = self.stock.financials
+            annual_balance_sheet = self.stock.balance_sheet
+            annual_cashflow = self.stock.cashflow
+            # 將財務報表轉為字串並儲存為屬性
+            self.financials_head = annual_financials.head().to_string()
+            self.balance_sheet_head = annual_balance_sheet.head().to_string()
+            self.cashflow_head = annual_cashflow.head().to_string()
             try:
                 financials = self.stock.financials
                 balance_sheet = self.stock.balance_sheet
                 net_income = financials.loc['Net Income'].iloc[0] if 'Net Income' in financials.index else 0
                 equity = balance_sheet.loc['Total Stockholder Equity'].iloc[0] if 'Total Stockholder Equity' in balance_sheet.index else 0
                 self.roe = net_income / equity if equity != 0 else 'N/A'
+                # 計算淨利率
+                if "Total Revenue" in annual_financials.index and "Net Income" in annual_financials.index:
+                    revenue = annual_financials.loc["Total Revenue"]
+                    net_income = annual_financials.loc["Net Income"]
+                    net_profit_margin = (net_income / revenue) * 100
+                    net_profit_margin_value = net_profit_margin.iloc[0]
+                    self.net_profit_margin_str = f"{net_profit_margin_value:.2f}%"
+                else:
+                    self.net_profit_margin_str = "無法計算（缺少 Total Revenue 或 Net Income 數據）"
+                # 計算流動比率
+                if ("Total Current Assets" in annual_balance_sheet.index and
+                    "Total Current Liabilities" in annual_balance_sheet.index):
+                    current_assets = annual_balance_sheet.loc["Total Current Assets"]
+                    current_liabilities = annual_balance_sheet.loc["Total Current Liabilities"]
+                    current_ratio = current_assets / current_liabilities
+                    current_ratio_value = current_ratio.iloc[0]
+                    self.current_ratio_str = f"{current_ratio_value:.2f}"
+                else:
+                    self.current_ratio_str = "無法計算（缺少 Total Current Assets 或 Total Current Liabilities 數據）"
             except Exception as inner_e:
-                logging.error("計算 ROE 時發生錯誤: %s", inner_e)
+                logging.error("計算財務指標時發生錯誤: %s", inner_e)
                 self.roe = 'N/A'
+                self.net_profit_margin_str = 'N/A'
+                self.current_ratio_str = 'N/A'
             logging.info("成功取得 %s 的財務資料", self.ticker)
         except Exception as e:
             logging.error("取得財務資料時發生錯誤: %s", e)
@@ -95,41 +127,125 @@ class StockAnalyzer:
     def _calculate_indicators(self):
         try:
             df = self.data.copy()
-            df['MA5'] = df['Close'].rolling(window=5, min_periods=5).mean()
-            df['MA20'] = df['Close'].rolling(window=20, min_periods=20).mean()
-            df['MA120'] = df['Close'].rolling(window=120, min_periods=120).mean()
-            df['MA240'] = df['Close'].rolling(window=240, min_periods=240).mean()
-
-            delta = df['Close'].diff()
-            up = delta.clip(lower=0)
-            down = -delta.clip(upper=0)
-            ema_up = up.ewm(span=14, adjust=False, min_periods=14).mean()
-            ema_down = down.ewm(span=14, adjust=False, min_periods=14).mean()
-            rs = ema_up / ema_down
-            df['RSI'] = 100 - (100 / (1 + rs))
-
-            short_ema = df['Close'].ewm(span=12, adjust=False, min_periods=12).mean()
-            long_ema = df['Close'].ewm(span=26, adjust=False, min_periods=26).mean()
-            df['MACD'] = short_ema - long_ema
-            df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False, min_periods=9).mean()
-
-            low_min = df['Low'].rolling(window=9, min_periods=1).min()
-            high_max = df['High'].rolling(window=9, min_periods=1).max()
-            rsv = (df['Close'] - low_min) / (high_max - low_min) * 100
-            df['K'] = rsv.ewm(span=3, adjust=False, min_periods=1).mean()
-            df['D'] = df['K'].ewm(span=3, adjust=False, min_periods=1).mean()
+            df['MA5'] = ta.sma(df['Close'], length=5)
+            df['MA20'] = ta.sma(df['Close'], length=20)
+            df['MA120'] = ta.sma(df['Close'], length=120)
+            df['MA240'] = ta.sma(df['Close'], length=240)
+            df['RSI'] = ta.rsi(df['Close'], length=12)
+            macd_df = ta.macd(df['Close'], fast=12, slow=26, signal=9)
+            df['MACD'] = macd_df['MACD_12_26_9']
+            df['MACD_signal'] = macd_df['MACDs_12_26_9']
+            df['MACD_hist'] = macd_df['MACDh_12_26_9']
+            stoch_df = ta.stoch(df['High'], df['Low'], df['Close'], k=9, d=3, smooth_k=3)
+            df['K'] = stoch_df['STOCHk_9_3_3']
+            df['D'] = stoch_df['STOCHd_9_3_3']
             df['J'] = 3 * df['K'] - 2 * df['D']
-
-            df['BB_middle'] = df['MA20']
-            bb_std = df['Close'].rolling(window=20, min_periods=20).std()
-            df['BB_upper'] = df['BB_middle'] + 2 * bb_std
-            df['BB_lower'] = df['BB_middle'] - 2 * bb_std
-
-            self.data = df.copy()
+            bbands = ta.bbands(df['Close'], length=20, std=2)
+            df['BB_lower'] = bbands['BBL_20_2.0']
+            df['BB_middle'] = bbands['BBM_20_2.0']
+            df['BB_upper'] = bbands['BBU_20_2.0']
+            df['WMSR'] = ta.willr(df['High'], df['Low'], df['Close'], length=14)
+            period_psy = 12
+            up_day = df['Close'] > df['Close'].shift(1)
+            df['PSY'] = up_day.rolling(period_psy).mean() * 100
+            period_vr = 26
+            df['UpVol'] = np.where(df['Close'] > df['Close'].shift(1), df['Volume'], 0)
+            df['DownVol'] = np.where(df['Close'] < df['Close'].shift(1), df['Volume'], 0)
+            df['FlatVol'] = np.where(df['Close'] == df['Close'].shift(1), df['Volume'], 0)
+            sum_up = df['UpVol'].rolling(period_vr).sum()
+            sum_down = df['DownVol'].rolling(period_vr).sum()
+            sum_flat = df['FlatVol'].rolling(period_vr).sum()
+            df['VR'] = np.where(
+                (sum_down + 0.5*sum_flat) == 0,
+                np.nan,
+                (sum_up + 0.5*sum_flat) / (sum_down + 0.5*sum_flat) * 100
+            )
+            ma_bias6 = ta.sma(df['Close'], length=6)
+            df['BIAS6'] = (df['Close'] - ma_bias6) / ma_bias6 * 100
+            period_arbr = 26
+            df['HO'] = df['High'] - df['Open']
+            df['OL'] = df['Open'] - df['Low']
+            sum_HO = df['HO'].rolling(period_arbr).sum()
+            sum_OL = df['OL'].rolling(period_arbr).sum()
+            df['AR'] = np.where(sum_OL == 0, np.nan, sum_HO / sum_OL * 100)
+            df['HPC'] = df['High'] - df['Close'].shift(1)
+            df['PCL'] = df['Close'].shift(1) - df['Low']
+            sum_HPC = df['HPC'].rolling(period_arbr).sum()
+            sum_PCL = df['PCL'].rolling(period_arbr).sum()
+            df['BR'] = np.where(sum_PCL == 0, np.nan, sum_HPC / sum_PCL * 100)
+            self.data = df
             logging.info("技術指標計算完成: %s", self.ticker)
         except Exception as e:
             logging.error("計算技術指標時發生錯誤: %s", e)
             raise
+
+    def _calculate_sentiment_score(self):
+        try:
+            last = self.data.iloc[-1]
+            score = 0
+            if last['RSI'] < 30:
+                score += 1
+            elif last['RSI'] > 70:
+                score -= 1
+            if last['MACD'] > last['MACD_signal']:
+                score += 1
+            else:
+                score -= 1
+            if last['K'] > last['D']:
+                score += 1
+            else:
+                score -= 1
+            if pd.notnull(last['VR']):
+                if last['VR'] > 150:
+                    score += 1
+                elif last['VR'] < 50:
+                    score -= 1
+            if pd.notnull(last['BIAS6']):
+                if last['BIAS6'] > 5:
+                    score -= 1
+                elif last['BIAS6'] < -5:
+                    score += 1
+            if score <= -2:
+                label = "看淡"
+            elif -1 <= score <= 1:
+                label = "中立"
+            else:
+                label = "看好"
+            return score, label
+        except Exception as e:
+            logging.error("計算情緒分數時發生錯誤: %s", e)
+            return 0, "中立"
+
+    def _plot_gauge(self, score, label):
+        try:
+            fig = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=score,
+                domain={'x': [0, 1], 'y': [0, 1]},
+                title={'text': f"指標情緒: {label}"},
+                gauge={
+                    'axis': {'range': [-5, 5]},
+                    'bar': {
+                        'color': "green" if score > 0 else ("red" if score < 0 else "gray")
+                    },
+                    'steps': [
+                        {'range': [-5, -2], 'color': 'rgba(255,0,0,0.3)'},
+                        {'range': [-2, -1], 'color': 'rgba(255,0,0,0.15)'},
+                        {'range': [-1, 1],  'color': 'rgba(128,128,128,0.15)'},
+                        {'range': [1, 2],   'color': 'rgba(0,255,0,0.15)'},
+                        {'range': [2, 5],   'color': 'rgba(0,255,0,0.3)'}
+                    ]
+                }
+            ))
+            fig.update_layout(width=400, height=400, margin=dict(l=50, r=50, t=50, b=50))
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            gauge_file = f"gauge_{self.ticker}_{timestamp}.html"
+            gauge_path = os.path.join('static', 'charts', gauge_file)
+            fig.write_html(gauge_path)
+            return gauge_path
+        except Exception as e:
+            logging.error("生成儀表板時發生錯誤: %s", e)
+            return None
 
     def calculate_fibonacci_levels(self, window=60):
         try:
@@ -160,7 +276,6 @@ class StockAnalyzer:
                     patterns.append("MA5向上穿越MA20 (黃金交叉)")
                 elif last['MA5'] < last['MA20'] and prev['MA5'] >= prev['MA20']:
                     patterns.append("MA5向下穿越MA20 (死亡交叉)")
-
             if len(self.data) >= 5:
                 recent_highs = self.data['High'].tail(5)
                 recent_lows = self.data['Low'].tail(5)
@@ -169,21 +284,18 @@ class StockAnalyzer:
                     recent_highs.iloc[4] < recent_highs.iloc[2] and
                     recent_lows.iloc[1] > recent_lows.iloc[3]):
                     patterns.append("潛在頭肩頂形態")
-
             if len(self.data) >= 5:
                 closes = self.data['Close'].tail(5)
                 if (closes.iloc[0] > closes.iloc[1] < closes.iloc[2] and
                     closes.iloc[2] > closes.iloc[3] < closes.iloc[4] and
                     closes.iloc[1] < closes.iloc[3] and closes.iloc[4] > closes.iloc[2]):
                     patterns.append("潛在雙底 (W 底)")
-
             if len(self.data) >= 5:
                 closes = self.data['Close'].tail(5)
                 if (closes.iloc[0] < closes.iloc[1] > closes.iloc[2] and
                     closes.iloc[2] < closes.iloc[3] > closes.iloc[4] and
                     closes.iloc[1] > closes.iloc[3] and closes.iloc[4] < closes.iloc[2]):
                     patterns.append("潛在雙頂 (M 頂)")
-
             if len(self.data) >= 10:
                 recent_highs = self.data['High'].tail(10)
                 recent_lows = self.data['Low'].tail(10)
@@ -192,7 +304,6 @@ class StockAnalyzer:
                 if (high_std < 0.02 * high_mean and
                     recent_lows.iloc[-1] > recent_lows.iloc[-3] > recent_lows.iloc[-5]):
                     patterns.append("潛在上升三角形")
-
             if len(self.data) >= 10:
                 recent_highs = self.data['High'].tail(10)
                 recent_lows = self.data['Low'].tail(10)
@@ -289,7 +400,6 @@ class StockAnalyzer:
             negative_count = sentiment_summary.count('Negative')
             total_news = len(sentiment_summary)
             sentiment_ratio = (positive_count - negative_count) / total_news if total_news > 0 else 0
-
             if last_row['RSI'] < 30 and last_row['MACD'] > last_row['MACD_signal'] and sentiment_ratio > 0:
                 return "Buy"
             elif last_row['RSI'] > 70 and sentiment_ratio < 0:
@@ -300,106 +410,341 @@ class StockAnalyzer:
             logging.error("生成策略時發生錯誤: %s", e)
             return "Hold"
 
-    def plot_analysis(self, days=180, ma_lines=['MA5', 'MA20']):
+
+
+    def plot_analysis(self, days=180, ma_lines=['MA5', 'MA20', 'MA120', 'MA240']):
         try:
+            # 取出最近 days 天的資料
             plot_data = self.data.tail(days).copy()
-            fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
-                                vertical_spacing=0.05,
-                                subplot_titles=("價格與均線", "RSI", "MACD", "KDJ"))
-
-            fig.add_trace(go.Candlestick(x=plot_data.index,
-                                         open=plot_data['Open'],
-                                         high=plot_data['High'],
-                                         low=plot_data['Low'],
-                                         close=plot_data['Close'],
-                                         name='蠟燭圖'),
-                          row=1, col=1)
-
+            
+            # 子圖配置
+            specs = [
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+                [{"secondary_y": True}],
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+            ]
+            
+            # 建立 8x1 的子圖佈局
+            fig = make_subplots(
+                rows=8, 
+                cols=1, 
+                shared_xaxes=True,
+                vertical_spacing=0.03,
+                subplot_titles=(
+                    "價格與均線", "RSI", "MACD", "KDJ", 
+                    "Williams %R", "PSY & VR", "BIAS", "AR & BR"
+                ),
+                row_heights=[0.35, 0.10, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15],
+                specs=specs
+            )
+            
+            # 蠟燭圖 -> 不顯示在圖例
+            fig.add_trace(
+                go.Candlestick(
+                    x=plot_data.index, 
+                    open=plot_data['Open'], 
+                    high=plot_data['High'],
+                    low=plot_data['Low'], 
+                    close=plot_data['Close'], 
+                    name='蠟燭圖',
+                    showlegend=False
+                ), 
+                row=1, 
+                col=1
+            )
+            
+            # MA 顏色對應表
+            ma_colors = {'MA5': 'blue', 'MA20': 'orange', 'MA120': 'purple', 'MA240': 'brown'}
+            
+            # 繪製 MA 線 -> 保留在圖例
             for ma in ma_lines:
                 if ma in plot_data.columns:
-                    color = {'MA5': 'blue', 'MA20': 'orange', 'MA120': 'purple', 'MA240': 'brown'}.get(ma, 'black')
-                    label = ma if ma not in ['MA120', 'MA240'] else (f"{ma} (半年線)" if ma=='MA120' else f"{ma} (年線)")
-                    fig.add_trace(go.Scatter(x=plot_data.index, y=plot_data[ma],
-                                             mode='lines', name=label,
-                                             line=dict(color=color, width=1)),
-                                  row=1, col=1)
-
-            fig.add_trace(go.Scatter(x=plot_data.index, y=plot_data['BB_upper'],
-                                     mode='lines', name='BB 上軌',
-                                     line=dict(color='grey', width=1)),
-                          row=1, col=1)
-            fig.add_trace(go.Scatter(x=plot_data.index, y=plot_data['BB_lower'],
-                                     mode='lines', name='BB 下軌',
-                                     line=dict(color='grey', width=1)),
-                          row=1, col=1)
-
-            fig.add_trace(go.Scatter(x=plot_data.index, y=plot_data['RSI'],
-                                     mode='lines', name='RSI',
-                                     line=dict(color='purple', width=1)),
-                          row=2, col=1)
-            fig.add_trace(go.Scatter(x=plot_data.index, y=[70]*len(plot_data),
-                                     mode='lines', name='超買區',
-                                     line=dict(color='red', dash='dash')),
-                          row=2, col=1)
-            fig.add_trace(go.Scatter(x=plot_data.index, y=[30]*len(plot_data),
-                                     mode='lines', name='超賣區',
-                                     line=dict(color='green', dash='dash')),
-                          row=2, col=1)
-
-            fig.add_trace(go.Scatter(x=plot_data.index, y=plot_data['MACD'],
-                                     mode='lines', name='MACD',
-                                     line=dict(color='blue', width=1)),
-                          row=3, col=1)
-            fig.add_trace(go.Scatter(x=plot_data.index, y=plot_data['MACD_signal'],
-                                     mode='lines', name='MACD Signal',
-                                     line=dict(color='orange', width=1)),
-                          row=3, col=1)
-            macd_hist = plot_data['MACD'] - plot_data['MACD_signal']
-            fig.add_trace(go.Bar(x=plot_data.index, y=macd_hist,
-                                 name='MACD Histogram',
-                                 marker_color='grey', opacity=0.5),
-                          row=3, col=1)
-
-            fig.add_trace(go.Scatter(x=plot_data.index, y=plot_data['K'],
-                                     mode='lines', name='K',
-                                     line=dict(color='blue', width=1)),
-                          row=4, col=1)
-            fig.add_trace(go.Scatter(x=plot_data.index, y=plot_data['D'],
-                                     mode='lines', name='D',
-                                     line=dict(color='orange', width=1)),
-                          row=4, col=1)
-            fig.add_trace(go.Scatter(x=plot_data.index, y=plot_data['J'],
-                                     mode='lines', name='J',
-                                     line=dict(color='green', width=1)),
-                          row=4, col=1)
-
-            fib_levels = self.calculate_fibonacci_levels()
-            for level, value in fib_levels.items():
-                fig.add_hline(y=value, line_width=1, line_dash="dash", line_color="grey",
-                              annotation_text=f"Fib {level}", annotation_position="right",
-                              row=1, col=1)
-
-            fig.update_layout(
-                title=f'{self.company_name} ({self.ticker}) 技術分析圖表',
-                height=1100,
-                width=900,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    color = ma_colors.get(ma, 'black')
+                    label = ma if ma not in ['MA120', 'MA240'] else (
+                        f"{ma} (半年線)" if ma == 'MA120' else f"{ma} (年線)"
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=plot_data.index, 
+                            y=plot_data[ma], 
+                            mode='lines', 
+                            name=label,
+                            line=dict(color=color, width=1),
+                            showlegend=True
+                        ), 
+                        row=1, 
+                        col=1
+                    )
+            
+            # 布林通道 -> 保留在圖例
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['BB_upper'], 
+                    mode='lines', 
+                    name='BB 上軌',
+                    line=dict(color='grey', width=1),
+                    showlegend=True
+                ), 
+                row=1, 
+                col=1
             )
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['BB_lower'], 
+                    mode='lines', 
+                    name='BB 下軌',
+                    line=dict(color='grey', width=1),
+                    showlegend=True
+                ), 
+                row=1, 
+                col=1
+            )
+            
+            # RSI -> 不顯示在圖例
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['RSI'], 
+                    mode='lines', 
+                    name='RSI',
+                    line=dict(color='purple', width=1),
+                    showlegend=False
+                ), 
+                row=2, 
+                col=1
+            )
+            fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="超買", row=2, col=1)
+            fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="超賣", row=2, col=1)
+            
+            # MACD -> 不顯示在圖例
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['MACD'], 
+                    mode='lines', 
+                    name='MACD',
+                    line=dict(color='blue', width=1),
+                    showlegend=False
+                ), 
+                row=3, 
+                col=1
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['MACD_signal'], 
+                    mode='lines', 
+                    name='MACD Signal',
+                    line=dict(color='orange', width=1),
+                    showlegend=False
+                ), 
+                row=3, 
+                col=1
+            )
+            macd_hist = plot_data['MACD'] - plot_data['MACD_signal']
+            fig.add_trace(
+                go.Bar(
+                    x=plot_data.index, 
+                    y=macd_hist, 
+                    name='MACD Histogram', 
+                    marker_color='grey', 
+                    opacity=0.5,
+                    showlegend=False
+                ),
+                row=3, 
+                col=1
+            )
+            
+            # KDJ -> 不顯示在圖例
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['K'], 
+                    mode='lines', 
+                    name='K',
+                    line=dict(color='blue', width=1),
+                    showlegend=False
+                ), 
+                row=4, 
+                col=1
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['D'], 
+                    mode='lines', 
+                    name='D',
+                    line=dict(color='orange', width=1),
+                    showlegend=False
+                ), 
+                row=4, 
+                col=1
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['J'], 
+                    mode='lines', 
+                    name='J',
+                    line=dict(color='green', width=1),
+                    showlegend=False
+                ), 
+                row=4, 
+                col=1
+            )
+            
+            # Williams %R -> 不顯示在圖例
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['WMSR'], 
+                    mode='lines', 
+                    name='WMSR',
+                    line=dict(color='purple', width=1),
+                    showlegend=False
+                ), 
+                row=5, 
+                col=1
+            )
+            fig.add_hline(y=-20, line_dash="dash", line_color="red", annotation_text="超買", row=5, col=1)
+            fig.add_hline(y=-80, line_dash="dash", line_color="green", annotation_text="超賣", row=5, col=1)
+            
+            # PSY & VR -> 不顯示在圖例
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['PSY'], 
+                    mode='lines', 
+                    name='PSY',
+                    line=dict(color='blue', width=1),
+                    showlegend=False
+                ), 
+                row=6, 
+                col=1, 
+                secondary_y=False
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['VR'], 
+                    mode='lines', 
+                    name='VR',
+                    line=dict(color='orange', width=1),
+                    showlegend=False
+                ), 
+                row=6, 
+                col=1, 
+                secondary_y=True
+            )
+            fig.update_yaxes(title_text="PSY", row=6, col=1, secondary_y=False)
+            fig.update_yaxes(title_text="VR", row=6, col=1, secondary_y=True)
+            
+            # BIAS -> 不顯示在圖例
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['BIAS6'], 
+                    mode='lines', 
+                    name='BIAS6',
+                    line=dict(color='green', width=1),
+                    showlegend=False
+                ), 
+                row=7, 
+                col=1
+            )
+            fig.add_hline(y=5, line_dash="dash", line_color="red", annotation_text="超買", row=7, col=1)
+            fig.add_hline(y=-5, line_dash="dash", line_color="green", annotation_text="超賣", row=7, col=1)
+            
+            # AR & BR -> 不顯示在圖例
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['AR'], 
+                    mode='lines', 
+                    name='AR',
+                    line=dict(color='blue', width=1),
+                    showlegend=False
+                ), 
+                row=8, 
+                col=1
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_data.index, 
+                    y=plot_data['BR'], 
+                    mode='lines', 
+                    name='BR',
+                    line=dict(color='orange', width=1),
+                    showlegend=False
+                ), 
+                row=8, 
+                col=1
+            )
+            
+            # 更新整體佈局
+            fig.update_layout(
+                title={'text': f"{self.company_name} ({self.ticker}) 技術分析圖表", 'x': 0.5,  'y': 0.95,'xanchor': 'center'},
+                height=1800,
+                width=1000,
+                margin=dict(l=50, r=50, t=80, b=50),
+                legend=dict(
+                    orientation="h", 
+                    yanchor="bottom", 
+                    y=1.02, 
+                    xanchor="right", 
+                    x=1
+                ),
+                template="plotly_white", 
+                showlegend=True
+            )
+           
+            
+            # 關閉下方自動生成的 X 軸縮放區塊
             fig.update_xaxes(rangeslider_visible=False)
+            
+            # 更新各子圖的 Y 軸標題
             fig.update_yaxes(title_text=f"價格 ({self.currency})", row=1, col=1)
             fig.update_yaxes(title_text="RSI", row=2, col=1)
             fig.update_yaxes(title_text="MACD", row=3, col=1)
             fig.update_yaxes(title_text="KDJ", row=4, col=1)
-
+            fig.update_yaxes(title_text="WMSR", row=5, col=1)
+            fig.update_yaxes(title_text="BIAS", row=7, col=1)
+            fig.update_yaxes(title_text="AR & BR", row=8, col=1)
+            
+            # 儲存為 HTML 檔
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            file_name = f"{self.ticker}_analysis_{timestamp}.html"
+            file_name = f"{self.ticker}_full_analysis_{timestamp}.html"
             html_path = os.path.join('static', 'charts', file_name)
             fig.write_html(html_path)
-            logging.info("圖表生成並儲存至 %s", html_path)
+            
+            logging.info("完整指標圖表生成並儲存至 %s", html_path)
             return html_path
+
         except Exception as e:
-            logging.error("生成圖表時發生錯誤: %s", e)
+            logging.error("生成完整指標圖表時發生錯誤: %s", e)
             raise
+
+    def format_market_cap(self):
+        if self.market_cap == 'N/A' or not isinstance(self.market_cap, (int, float)):
+            return 'N/A'
+        value = float(self.market_cap)
+        units_tw = ['元', '萬', '億', '兆']
+        units_us = ['USD', '萬', '億', '兆']
+        units = units_tw if self.currency == 'TWD' else units_us
+        divisor = 1
+        unit_idx = 0
+        while value >= 10000 and unit_idx < len(units) - 1:
+            value /= 10000
+            unit_idx += 1
+            divisor *= 10000
+        return f"{value:.2f} {units[unit_idx]} {self.currency}"
 
     def generate_ai_analysis(self, days=180):
         try:
@@ -408,11 +753,9 @@ class StockAnalyzer:
             last_price = self.data['Close'].iloc[-1]
             prev_price = self.data['Close'].iloc[-2]
             price_change = ((last_price - prev_price) / prev_price * 100) if prev_price else 0
-
             recent_news = self.get_recent_news()
             news_summary = "\n".join([f"- [{news['date']}] {news['title']} (來源: {news['source']}, 情緒: {news['sentiment']})" 
-                                      for news in recent_news])
-
+                                    for news in recent_news])
             technical_status = {
                 'last_price': last_price,
                 'price_change': price_change,
@@ -429,11 +772,11 @@ class StockAnalyzer:
                 'kdj_d': self.data['D'].iloc[-1],
                 'kdj_j': self.data['J'].iloc[-1],
                 'patterns': self.identify_patterns(),
-                'fib_levels': self.calculate_fibonacci_levels()
+                'fib_levels': self.calculate_fibonacci_levels(),
+                'financial_head': self.financials_head
             }
-
             prompt = f"""
-你是一位擁有十年經驗的專業股市分析師，請根據以下 {self.company_name} ({self.ticker}) 的數據和技術指標進行深入的股市分析，並使用專業術語（如動能、趨勢、波動性）解釋其影響：
+你是一位擁有三十年經驗的專業股市分析師，請根據以下 {self.company_name} ({self.ticker}) 的數據和技術指標進行深入的股市分析，並使用專業術語（如動能、趨勢、波動性）解釋其影響(不要透漏自己得身分，開頭直接:以下是針對(股票名稱)股票的分析，然後幫我排版排好一點)：
 
 【基本資訊】
 - 公司名稱: {self.company_name}
@@ -443,7 +786,7 @@ class StockAnalyzer:
 
 【財務數據】
 - 市盈率 (Trailing P/E): {self.pe_ratio}
-- 市值: {self.market_cap}
+- 市值: {self.format_market_cap()}
 - 預期市盈率 (Forward P/E): {self.forward_pe}
 - 利潤率: {self.profit_margins}
 - EPS: {self.eps}
@@ -460,6 +803,12 @@ class StockAnalyzer:
 - MACD: {technical_status['macd']:.2f}
 - MACD Signal: {technical_status['macd_signal']:.2f}
 - KDJ (K/D/J): {technical_status['kdj_k']:.2f}/{technical_status['kdj_d']:.2f}/{technical_status['kdj_j']:.2f}
+- WMSR (Williams %R): {self.data['WMSR'].iloc[-1]:.2f}
+- PSY: {self.data['PSY'].iloc[-1]:.2f}
+- VR: {self.data['VR'].iloc[-1]:.2f}
+- BIAS6: {self.data['BIAS6'].iloc[-1]:.2f}
+- AR: {self.data['AR'].iloc[-1]:.2f}
+- BR: {self.data['BR'].iloc[-1]:.2f}
 
 【技術形態】
 - {', '.join(technical_status['patterns']) if technical_status['patterns'] else '無明顯技術形態'}
@@ -472,16 +821,18 @@ class StockAnalyzer:
 
 請按以下結構提供分析：
 1. 近期價格走勢評估（分析動能與趨勢）
-2. 支撐與壓力位分析（解釋 Fibonacci 和布林帶的作用）
-3. 短期走勢預測（基於 MACD、RSI 和 KDJ）
+2. 支撐與壓力位分析（可根據Fibonacci、布林帶還有均線）
+3. 短期走勢預測（基於 MACD、RSI 和 KDJ 或其他指標，其他指標盡量只使用非中性有明顯訊號的）
 4. 策略建議與風險分析（提供買入、賣出或持有建議，並說明理由）
-5. 該股票近期相關新聞的影響分析（結合情緒分析）
+5. 講解該股票近期相關新聞並對其的影響分析（結合情緒分析）
+6. 綜合分析給出結論（可加入給你的其他數據或個人見解）
 
 具體要求：
 - 解釋 RSI 的超買超賣情況
 - 分析 MACD 的趨勢信號
 - 評估 KDJ 的買賣信號
 - 描述布林帶的價格波動性
+- 可適度加入 PSY、VR、BIAS、AR、BR、WMSR 指標解讀
 
 最後，請在分析報告的結尾加入以下免責聲明：
 "本分析報告僅供參考，不構成投資建議。投資者應自行承擔投資風險。"
@@ -492,18 +843,64 @@ class StockAnalyzer:
         except Exception as e:
             logging.error("生成 AI 分析時發生錯誤: %s", e)
             return f"生成 AI 分析時發生錯誤: {str(e)}"
+        
+    def generate_financial_analysis(self, days=180):
+        try:
+            prompt = f"""
+你是一位擁有三十年經驗的專業財金分析師，請根據以下 {self.company_name} ({self.ticker}) 的數據和財務數據進行深入的分析，若有數據缺失的部分就無需提及，並使用專業術語解釋(不要透漏自己得身分，開頭直接:以下是針對(股票名稱)的分析，然後幫我排版排好一點)：以下是針對 {self.company_name} ({self.ticker}) 的財務分析：
 
-    def run_full_analysis(self, days_to_analyze=180, ma_lines=['MA5', 'MA20']):
+請按以下結構提供分析：
+請根據以下財務數據進行深入分析，並評估該公司的盈利能力、成長性、流動性及潛在風險，
+1. 財務健康狀況評估（分析盈利能力、流動性和負債情況）
+2. 成長性分析 (根據過去幾年的財務數據評估公司的成長性)
+3. 估值分析（基於市盈率和預期市盈率）
+4. 風險（根據財務數據的內容說明潛在財務風險）
+5. 綜合結論
+
+【基本資訊】
+- 公司名稱: {self.company_name}
+- 股票代碼: {self.ticker}
+
+【財務指標】
+- 淨利率: {self.net_profit_margin_str}
+- 流動比率: {self.current_ratio_str}
+- 市盈率 (Trailing P/E): {self.pe_ratio}
+- 預期市盈率 (Forward P/E): {self.forward_pe}
+- 利潤率: {self.profit_margins}
+- EPS: {self.eps}
+- ROE: {self.roe}
+- 年度損益表:\n{self.financials_head}
+- 年度資產負債表:\n{self.balance_sheet_head}
+- 年度現金流量表:\n{self.cashflow_head}
+
+
+
+最後，請在分析報告的結尾加入以下免責聲明：
+"本分析報告僅供參考，不構成投資建議。投資者應自行承擔投資風險。"
+            """
+            response = self.model.generate_content(prompt)
+            response_text = response.text.replace('\n', '<br>')
+            return response_text
+        except Exception as e:
+            logging.error("生成財務分析時發生錯誤: %s", e)
+            return f"生成財務分析時發生錯誤: {str(e)}"
+        
+    def run_full_analysis(self, days_to_analyze=180, ma_lines=['MA5', 'MA20', 'MA120', 'MA240']):
         try:
             ai_analysis = self.generate_ai_analysis(days_to_analyze)
+            financial_analysis = self.generate_financial_analysis(days_to_analyze)
             chart_path = self.plot_analysis(days_to_analyze, ma_lines)
             strategy = self.generate_strategy()
-
+            score, label = self._calculate_sentiment_score()
+            gauge_path = self._plot_gauge(score, label)
             last_row = self.data.iloc[-1]
             summary = {
                 "company_name": self.company_name,
                 "ticker": self.ticker,
                 "close_price": float(last_row['Close']),
+                "open_price": float(last_row['Open']),
+                "high_price": float(last_row['High']),
+                "low_price": float(last_row['Low']),
                 "currency": self.currency,
                 "rsi": float(last_row['RSI']),
                 "ma5": float(last_row['MA5']),
@@ -517,33 +914,40 @@ class StockAnalyzer:
                 "kdj_k": float(last_row['K']),
                 "kdj_d": float(last_row['D']),
                 "kdj_j": float(last_row['J']),
+                "wmsr": float(last_row['WMSR']),
+                "psy": float(last_row['PSY']),
+                "vr": float(last_row['VR']),
+                "bias6": float(last_row['BIAS6']),
+                "ar": float(last_row['AR']),
+                "br": float(last_row['BR']),
                 "patterns": self.identify_patterns(),
                 "fib_levels": {k: float(v) for k, v in self.calculate_fibonacci_levels().items()},
-                "strategy": strategy
+                "strategy": strategy,
+                "pe_ratio": self.pe_ratio,
+                "market_cap": self.format_market_cap(),
+                "forward_pe": self.forward_pe,
+                "eps": self.eps,
+                "sentiment_score": score,
+                "sentiment_label": label
             }
-
-            logging.info("財務資料: PE={0}, 市值={1}, Forward P/E={2}, 利潤率={3}, EPS={4}, ROE={5}".format(
-                self.pe_ratio, self.market_cap, self.forward_pe, self.profit_margins, self.eps, self.roe))
-            recent_news = self.get_recent_news()
-            for i, news in enumerate(recent_news, 1):
-                logging.info("新聞 %d: 標題: %s, 日期: %s, 來源: %s, 情緒: %s, 連結: %s",
-                             i, news['title'], news['date'], news['source'], news['sentiment'], news['link'])
-
             timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
             result_file = os.path.join('static', 'data', f"{self.ticker}_analysis_{timestamp}.json")
             with open(result_file, 'w', encoding='utf-8') as f:
                 json.dump({
-                    'analysis': ai_analysis,
+                    'a_analysis': ai_analysis,
+                    'f_analysis': financial_analysis,
                     'summary': summary,
                     'chart_path': chart_path,
+                    'gauge_path': gauge_path,
                     'timestamp': dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }, f, ensure_ascii=False, indent=4)
             logging.info("JSON 結果儲存至 %s", result_file)
-
             return {
-                'analysis': ai_analysis,
+                'a_analysis': ai_analysis,
+                'f_analysis': financial_analysis,
                 'summary': summary,
                 'chart_path': chart_path,
+                'gauge_path': gauge_path,
                 'timestamp': dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
         except Exception as e:
@@ -569,21 +973,17 @@ def analyze():
         period = '10y'
         days = int(data.get('days', 180))
         ma_lines = data.getlist('ma_lines')
-
         api_key = os.getenv("GEMINI_API_KEY")
         if not ticker:
             return jsonify({'error': '請輸入股票代碼'}), 400
         if not api_key:
             return jsonify({'error': 'API 金鑰無效，請檢查 .env 設定'}), 500
-
         analyzer = StockAnalyzer(ticker=ticker, api_key=api_key, period=period, market=market)
         results = analyzer.run_full_analysis(days_to_analyze=days, ma_lines=ma_lines or ['MA5', 'MA20'])
-
         timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
         result_file = f"static/data/{ticker}_analysis_{timestamp}.json"
         with open(result_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=4)
-
         session['last_analysis_file'] = result_file
         logging.info("Session 更新，分析檔案: %s", result_file)
         return jsonify({'status': 'success', 'redirect': '/results'})
@@ -597,10 +997,8 @@ def results():
     if not result_file or not os.path.exists(result_file):
         logging.warning("Session 中無分析檔案，或檔案不存在")
         return redirect('/')
-
     with open(result_file, 'r', encoding='utf-8') as f:
         analysis_results = json.load(f)
-
     os.remove(result_file)
     session.pop('last_analysis_file', None)
     return render_template('results.html', results=analysis_results)
