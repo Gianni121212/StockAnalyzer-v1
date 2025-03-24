@@ -1,34 +1,150 @@
-from flask import Flask, render_template, request, jsonify, session, redirect  
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import json
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime
-from dotenv import load_dotenv
-import google.generativeai as genai
-import warnings
 import os
+import re
 import secrets
+import logging
+import warnings
 import datetime as dt
+import numpy as np
+import pandas as pd
+import pandas_ta as ta
+import yfinance as yf
 import feedparser
 import urllib.parse
+from flask import Flask, render_template, request, jsonify, send_from_directory, redirect, url_for
 from transformers import pipeline
-import logging
-import pandas_ta as ta
+from dotenv import load_dotenv
+import google.generativeai as genai
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import mysql.connector
+import bcrypt
+import json
+import plotly.express as px
+import chart_studio.plotly as py
+import chart_studio.tools as tls
+
+# 載入環境變數
+load_dotenv()
 
 warnings.filterwarnings('ignore')
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s %(levelname)s:%(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 
+# 建立需要的資料夾
 for path in ['static/charts', 'static/data']:
     os.makedirs(path, exist_ok=True)
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 
+# 設定 Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
+general_model = genai.GenerativeModel("models/gemini-1.5-pro")
+portfolio_model = genai.GenerativeModel("models/gemini-2.0-flash-thinking-exp")
+
+# 資料庫連接設定
+def get_db_connection():
+    try:
+        conn = mysql.connector.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            user=os.getenv("DB_USER", "root"),
+            password=os.getenv("DB_PASSWORD", "0912559910"),
+            database=os.getenv("DB_NAME", "testdb")
+        )
+        return conn
+    except Exception as e:
+        logging.error(f"資料庫連接錯誤: {e}")
+        return None
+
+# 初始化資料庫表格
+def init_database():
+    conn = get_db_connection()
+    if conn:
+        cursor = conn.cursor()
+        
+        # 創建用戶表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(50) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            email VARCHAR(100) UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        
+        # 創建追蹤清單表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT,
+            ticker VARCHAR(20) NOT NULL,
+            name VARCHAR(100) NOT NULL,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            UNIQUE(user_id, ticker)
+        )
+        ''')
+        
+        # 創建設定表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT,
+            dark_mode BOOLEAN DEFAULT TRUE,
+            font_size VARCHAR(10) DEFAULT 'medium',
+            price_alert BOOLEAN DEFAULT FALSE,
+            market_summary BOOLEAN DEFAULT TRUE,
+            data_source VARCHAR(20) DEFAULT 'default',
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            UNIQUE(user_id)
+        )
+        ''')
+        
+        # 創建股票數據表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS stocks (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            symbol VARCHAR(20) UNIQUE NOT NULL,
+            name VARCHAR(100) NOT NULL,
+            market VARCHAR(10) NOT NULL,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ma5 FLOAT DEFAULT NULL,
+            ma20 FLOAT DEFAULT NULL,
+            ma50 FLOAT DEFAULT NULL,
+            ma120 FLOAT DEFAULT NULL,
+            ma200 FLOAT DEFAULT NULL,
+            bb_upper FLOAT DEFAULT NULL,
+            bb_middle FLOAT DEFAULT NULL,
+            bb_lower FLOAT DEFAULT NULL,
+            rsi FLOAT DEFAULT NULL,
+            wmsr FLOAT DEFAULT NULL,
+            psy FLOAT DEFAULT NULL,
+            bias6 FLOAT DEFAULT NULL,
+            macd FLOAT DEFAULT NULL,
+            macd_signal FLOAT DEFAULT NULL,
+            macd_hist FLOAT DEFAULT NULL,
+            k FLOAT DEFAULT NULL,
+            d FLOAT DEFAULT NULL,
+            j FLOAT DEFAULT NULL,
+            pe_ratio FLOAT DEFAULT NULL,
+            market_cap BIGINT DEFAULT NULL,
+            open_price FLOAT DEFAULT NULL,
+            close_price FLOAT DEFAULT NULL,
+            high_price FLOAT DEFAULT NULL,
+            low_price FLOAT DEFAULT NULL,
+            volume BIGINT DEFAULT NULL
+        )
+        ''')
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        logging.info("資料庫初始化成功")
+
+# ------------------ 股票分析功能 ------------------
 class StockAnalyzer:
     def __init__(self, ticker: str, api_key: str, period: str = "10y", market: str = "TW"):
         self.ticker = ticker.strip()
@@ -46,7 +162,6 @@ class StockAnalyzer:
         self.profit_margins = None
         self.eps = None
         self.roe = None
-        # 新增財務報表和計算指標的屬性
         self.financials_head = None
         self.balance_sheet_head = None
         self.cashflow_head = None
@@ -54,12 +169,13 @@ class StockAnalyzer:
         self.current_ratio_str = None
 
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("models/gemini-2.0-flash")
+        self.model = genai.GenerativeModel("models/gemini-2.0-flash-thinking-exp")
         self.sentiment_analyzer = pipeline('sentiment-analysis', model='yiyanghkust/finbert-tone')
 
         self._get_data()
         self._get_financial_data()
         self._calculate_indicators()
+        self._update_db_data()
 
     def _get_data(self):
         try:
@@ -82,20 +198,23 @@ class StockAnalyzer:
             self.forward_pe = info.get('forwardPE', 'N/A')
             self.profit_margins = info.get('profitMargins', 'N/A')
             self.eps = info.get('trailingEps', 'N/A')
+
             annual_financials = self.stock.financials
             annual_balance_sheet = self.stock.balance_sheet
             annual_cashflow = self.stock.cashflow
-            # 將財務報表轉為字串並儲存為屬性
+
             self.financials_head = annual_financials.head().to_string()
             self.balance_sheet_head = annual_balance_sheet.head().to_string()
             self.cashflow_head = annual_cashflow.head().to_string()
+
             try:
                 financials = self.stock.financials
                 balance_sheet = self.stock.balance_sheet
+
                 net_income = financials.loc['Net Income'].iloc[0] if 'Net Income' in financials.index else 0
                 equity = balance_sheet.loc['Total Stockholder Equity'].iloc[0] if 'Total Stockholder Equity' in balance_sheet.index else 0
                 self.roe = net_income / equity if equity != 0 else 'N/A'
-                # 計算淨利率
+
                 if "Total Revenue" in annual_financials.index and "Net Income" in annual_financials.index:
                     revenue = annual_financials.loc["Total Revenue"]
                     net_income = annual_financials.loc["Net Income"]
@@ -104,7 +223,7 @@ class StockAnalyzer:
                     self.net_profit_margin_str = f"{net_profit_margin_value:.2f}%"
                 else:
                     self.net_profit_margin_str = "無法計算（缺少 Total Revenue 或 Net Income 數據）"
-                # 計算流動比率
+
                 if ("Total Current Assets" in annual_balance_sheet.index and
                     "Total Current Liabilities" in annual_balance_sheet.index):
                     current_assets = annual_balance_sheet.loc["Total Current Assets"]
@@ -114,12 +233,15 @@ class StockAnalyzer:
                     self.current_ratio_str = f"{current_ratio_value:.2f}"
                 else:
                     self.current_ratio_str = "無法計算（缺少 Total Current Assets 或 Total Current Liabilities 數據）"
+
             except Exception as inner_e:
                 logging.error("計算財務指標時發生錯誤: %s", inner_e)
                 self.roe = 'N/A'
                 self.net_profit_margin_str = 'N/A'
                 self.current_ratio_str = 'N/A'
+
             logging.info("成功取得 %s 的財務資料", self.ticker)
+
         except Exception as e:
             logging.error("取得財務資料時發生錯誤: %s", e)
             raise
@@ -129,8 +251,9 @@ class StockAnalyzer:
             df = self.data.copy()
             df['MA5'] = ta.sma(df['Close'], length=5)
             df['MA20'] = ta.sma(df['Close'], length=20)
+            df['MA50'] = ta.sma(df['Close'], length=50)
             df['MA120'] = ta.sma(df['Close'], length=120)
-            df['MA240'] = ta.sma(df['Close'], length=240)
+            df['MA200'] = ta.sma(df['Close'], length=200)
             df['RSI'] = ta.rsi(df['Close'], length=12)
             macd_df = ta.macd(df['Close'], fast=12, slow=26, signal=9)
             df['MACD'] = macd_df['MACD_12_26_9']
@@ -145,874 +268,1133 @@ class StockAnalyzer:
             df['BB_middle'] = bbands['BBM_20_2.0']
             df['BB_upper'] = bbands['BBU_20_2.0']
             df['WMSR'] = ta.willr(df['High'], df['Low'], df['Close'], length=14)
-            period_psy = 12
-            up_day = df['Close'] > df['Close'].shift(1)
-            df['PSY'] = up_day.rolling(period_psy).mean() * 100
-            period_vr = 26
-            df['UpVol'] = np.where(df['Close'] > df['Close'].shift(1), df['Volume'], 0)
-            df['DownVol'] = np.where(df['Close'] < df['Close'].shift(1), df['Volume'], 0)
-            df['FlatVol'] = np.where(df['Close'] == df['Close'].shift(1), df['Volume'], 0)
-            sum_up = df['UpVol'].rolling(period_vr).sum()
-            sum_down = df['DownVol'].rolling(period_vr).sum()
-            sum_flat = df['FlatVol'].rolling(period_vr).sum()
-            df['VR'] = np.where(
-                (sum_down + 0.5*sum_flat) == 0,
-                np.nan,
-                (sum_up + 0.5*sum_flat) / (sum_down + 0.5*sum_flat) * 100
-            )
-            ma_bias6 = ta.sma(df['Close'], length=6)
-            df['BIAS6'] = (df['Close'] - ma_bias6) / ma_bias6 * 100
-            period_arbr = 26
-            df['HO'] = df['High'] - df['Open']
-            df['OL'] = df['Open'] - df['Low']
-            sum_HO = df['HO'].rolling(period_arbr).sum()
-            sum_OL = df['OL'].rolling(period_arbr).sum()
-            df['AR'] = np.where(sum_OL == 0, np.nan, sum_HO / sum_OL * 100)
-            df['HPC'] = df['High'] - df['Close'].shift(1)
-            df['PCL'] = df['Close'].shift(1) - df['Low']
-            sum_HPC = df['HPC'].rolling(period_arbr).sum()
-            sum_PCL = df['PCL'].rolling(period_arbr).sum()
-            df['BR'] = np.where(sum_PCL == 0, np.nan, sum_HPC / sum_PCL * 100)
+            df['OBV'] = ta.obv(df['Close'], df['Volume'])
+            df['ADX'] = ta.adx(df['High'], df['Low'], df['Close'], length=14)['ADX_14']
+            
+            # 計算布林帶寬度
+            df['BB_width'] = (df['BB_upper'] - df['BB_lower']) / df['BB_middle']
+            
+            # 計算成交量變化率
+            df['Volume_Change'] = df['Volume'].pct_change() * 100
+            
+            # 計算價格動量
+            df['Momentum'] = df['Close'] - df['Close'].shift(10)
+            
+            # 計算波動率 (20日標準差)
+            df['Volatility'] = df['Close'].rolling(window=20).std()
+            
+            # 計算心理線指標 (PSY)
+            df['PSY'] = df['Close'].diff().apply(lambda x: 1 if x > 0 else 0).rolling(12).sum() / 12 * 100
+            
+            # 計算乖離率 (BIAS6)
+            df['BIAS6'] = (df['Close'] - df['Close'].rolling(window=6).mean()) / df['Close'].rolling(window=6).mean() * 100
+            
             self.data = df
-            logging.info("技術指標計算完成: %s", self.ticker)
+            logging.info("成功計算 %s 的技術指標", self.ticker)
         except Exception as e:
             logging.error("計算技術指標時發生錯誤: %s", e)
             raise
 
-    def _calculate_sentiment_score(self):
+    def _update_db_data(self):
+        """更新資料庫中的股票數據"""
         try:
-            last = self.data.iloc[-1]
-            score = 0
-            if last['RSI'] < 30:
-                score += 1
-            elif last['RSI'] > 70:
-                score -= 1
-            if last['MACD'] > last['MACD_signal']:
-                score += 1
-            else:
-                score -= 1
-            if last['K'] > last['D']:
-                score += 1
-            else:
-                score -= 1
-            if pd.notnull(last['VR']):
-                if last['VR'] > 150:
-                    score += 1
-                elif last['VR'] < 50:
-                    score -= 1
-            if pd.notnull(last['BIAS6']):
-                if last['BIAS6'] > 5:
-                    score -= 1
-                elif last['BIAS6'] < -5:
-                    score += 1
-            if score <= -2:
-                label = "看淡"
-            elif -1 <= score <= 1:
-                label = "中立"
-            else:
-                label = "看好"
-            return score, label
-        except Exception as e:
-            logging.error("計算情緒分數時發生錯誤: %s", e)
-            return 0, "中立"
-
-    def _plot_gauge(self, score, label):
-        try:
-            fig = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=score,
-                domain={'x': [0, 1], 'y': [0, 1]},
-                title={'text': f"指標情緒: {label}"},
-                gauge={
-                    'axis': {'range': [-5, 5]},
-                    'bar': {
-                        'color': "green" if score > 0 else ("red" if score < 0 else "gray")
-                    },
-                    'steps': [
-                        {'range': [-5, -2], 'color': 'rgba(255,0,0,0.3)'},
-                        {'range': [-2, -1], 'color': 'rgba(255,0,0,0.15)'},
-                        {'range': [-1, 1],  'color': 'rgba(128,128,128,0.15)'},
-                        {'range': [1, 2],   'color': 'rgba(0,255,0,0.15)'},
-                        {'range': [2, 5],   'color': 'rgba(0,255,0,0.3)'}
-                    ]
-                }
-            ))
-            fig.update_layout(width=400, height=400, margin=dict(l=50, r=50, t=50, b=50))
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            gauge_file = f"gauge_{self.ticker}_{timestamp}.html"
-            gauge_path = os.path.join('static', 'charts', gauge_file)
-            fig.write_html(gauge_path)
-            return gauge_path
-        except Exception as e:
-            logging.error("生成儀表板時發生錯誤: %s", e)
-            return None
-
-    def calculate_fibonacci_levels(self, window=60):
-        try:
-            recent_data = self.data.tail(window)
-            max_price = recent_data['High'].max()
-            min_price = recent_data['Low'].min()
-            diff = max_price - min_price
-            levels = {
-                '0.0': min_price,
-                '0.236': min_price + 0.236 * diff,
-                '0.382': min_price + 0.382 * diff,
-                '0.5': min_price + 0.5 * diff,
-                '0.618': min_price + 0.618 * diff,
-                '1.0': max_price
+            conn = get_db_connection()
+            if not conn:
+                logging.error("無法連接資料庫，跳過數據更新")
+                return
+                
+            cursor = conn.cursor()
+            
+            # 檢查股票是否已存在
+            cursor.execute("SELECT id FROM stocks WHERE symbol = %s", (self.ticker,))
+            result = cursor.fetchone()
+            
+            latest_data = self.data.iloc[-1]
+            
+            # 準備數據
+            stock_data = {
+                'symbol': self.ticker,
+                'name': self.company_name,
+                'market': self.market,
+                'ma5': float(latest_data['MA5']) if not pd.isna(latest_data['MA5']) else None,
+                'ma20': float(latest_data['MA20']) if not pd.isna(latest_data['MA20']) else None,
+                'ma50': float(latest_data['MA50']) if not pd.isna(latest_data['MA50']) else None,
+                'ma120': float(latest_data['MA120']) if not pd.isna(latest_data['MA120']) else None,
+                'ma200': float(latest_data['MA200']) if not pd.isna(latest_data['MA200']) else None,
+                'bb_upper': float(latest_data['BB_upper']) if not pd.isna(latest_data['BB_upper']) else None,
+                'bb_middle': float(latest_data['BB_middle']) if not pd.isna(latest_data['BB_middle']) else None,
+                'bb_lower': float(latest_data['BB_lower']) if not pd.isna(latest_data['BB_lower']) else None,
+                'rsi': float(latest_data['RSI']) if not pd.isna(latest_data['RSI']) else None,
+                'wmsr': float(latest_data['WMSR']) if not pd.isna(latest_data['WMSR']) else None,
+                'psy': float(latest_data['PSY']) if not pd.isna(latest_data['PSY']) else None,
+                'bias6': float(latest_data['BIAS6']) if not pd.isna(latest_data['BIAS6']) else None,
+                'macd': float(latest_data['MACD']) if not pd.isna(latest_data['MACD']) else None,
+                'macd_signal': float(latest_data['MACD_signal']) if not pd.isna(latest_data['MACD_signal']) else None,
+                'macd_hist': float(latest_data['MACD_hist']) if not pd.isna(latest_data['MACD_hist']) else None,
+                'k': float(latest_data['K']) if not pd.isna(latest_data['K']) else None,
+                'd': float(latest_data['D']) if not pd.isna(latest_data['D']) else None,
+                'j': float(latest_data['J']) if not pd.isna(latest_data['J']) else None,
+                'pe_ratio': float(self.pe_ratio) if isinstance(self.pe_ratio, (int, float)) else None,
+                'market_cap': int(self.market_cap) if isinstance(self.market_cap, (int, float)) else None,
+                'open_price': float(latest_data['Open']) if not pd.isna(latest_data['Open']) else None,
+                'close_price': float(latest_data['Close']) if not pd.isna(latest_data['Close']) else None,
+                'high_price': float(latest_data['High']) if not pd.isna(latest_data['High']) else None,
+                'low_price': float(latest_data['Low']) if not pd.isna(latest_data['Low']) else None,
+                'volume': int(latest_data['Volume']) if not pd.isna(latest_data['Volume']) else None
             }
-            return levels
+            
+            if result:
+                # 更新現有記錄
+                update_query = """
+                UPDATE stocks SET 
+                    name = %s, market = %s, last_updated = NOW(),
+                    ma5 = %s, ma20 = %s, ma50 = %s, ma120 = %s, ma200 = %s,
+                    bb_upper = %s, bb_middle = %s, bb_lower = %s,
+                    rsi = %s, wmsr = %s, psy = %s, bias6 = %s,
+                    macd = %s, macd_signal = %s, macd_hist = %s,
+                    k = %s, d = %s, j = %s,
+                    pe_ratio = %s, market_cap = %s,
+                    open_price = %s, close_price = %s, high_price = %s, low_price = %s, volume = %s
+                WHERE symbol = %s
+                """
+                cursor.execute(update_query, (
+                    stock_data['name'], stock_data['market'],
+                    stock_data['ma5'], stock_data['ma20'], stock_data['ma50'], stock_data['ma120'], stock_data['ma200'],
+                    stock_data['bb_upper'], stock_data['bb_middle'], stock_data['bb_lower'],
+                    stock_data['rsi'], stock_data['wmsr'], stock_data['psy'], stock_data['bias6'],
+                    stock_data['macd'], stock_data['macd_signal'], stock_data['macd_hist'],
+                    stock_data['k'], stock_data['d'], stock_data['j'],
+                    stock_data['pe_ratio'], stock_data['market_cap'],
+                    stock_data['open_price'], stock_data['close_price'], stock_data['high_price'], stock_data['low_price'], stock_data['volume'],
+                    self.ticker
+                ))
+            else:
+                # 插入新記錄
+                insert_query = """
+                INSERT INTO stocks (
+                    symbol, name, market, last_updated,
+                    ma5, ma20, ma50, ma120, ma200,
+                    bb_upper, bb_middle, bb_lower,
+                    rsi, wmsr, psy, bias6,
+                    macd, macd_signal, macd_hist,
+                    k, d, j,
+                    pe_ratio, market_cap,
+                    open_price, close_price, high_price, low_price, volume
+                ) VALUES (
+                    %s, %s, %s, NOW(),
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s,
+                    %s, %s, %s, %s, %s
+                )
+                """
+                cursor.execute(insert_query, (
+                    self.ticker, stock_data['name'], stock_data['market'],
+                    stock_data['ma5'], stock_data['ma20'], stock_data['ma50'], stock_data['ma120'], stock_data['ma200'],
+                    stock_data['bb_upper'], stock_data['bb_middle'], stock_data['bb_lower'],
+                    stock_data['rsi'], stock_data['wmsr'], stock_data['psy'], stock_data['bias6'],
+                    stock_data['macd'], stock_data['macd_signal'], stock_data['macd_hist'],
+                    stock_data['k'], stock_data['d'], stock_data['j'],
+                    stock_data['pe_ratio'], stock_data['market_cap'],
+                    stock_data['open_price'], stock_data['close_price'], stock_data['high_price'], stock_data['low_price'], stock_data['volume']
+                ))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            logging.info("成功更新 %s 的資料庫數據", self.ticker)
         except Exception as e:
-            logging.error("計算 Fibonacci 水平時發生錯誤: %s", e)
-            return {}
+            logging.error("更新資料庫數據時發生錯誤: %s", e)
 
-    def identify_patterns(self):
-        patterns = []
+    def _identify_patterns(self, days=30):
+        """識別最近的技術形態"""
         try:
-            if len(self.data) >= 2:
-                last = self.data.iloc[-1]
-                prev = self.data.iloc[-2]
-                if last['MA5'] > last['MA20'] and prev['MA5'] <= prev['MA20']:
-                    patterns.append("MA5向上穿越MA20 (黃金交叉)")
-                elif last['MA5'] < last['MA20'] and prev['MA5'] >= prev['MA20']:
-                    patterns.append("MA5向下穿越MA20 (死亡交叉)")
-            if len(self.data) >= 5:
-                recent_highs = self.data['High'].tail(5)
-                recent_lows = self.data['Low'].tail(5)
-                if (recent_highs.iloc[1] < recent_highs.iloc[2] > recent_highs.iloc[3] and
-                    recent_highs.iloc[0] < recent_highs.iloc[2] and
-                    recent_highs.iloc[4] < recent_highs.iloc[2] and
-                    recent_lows.iloc[1] > recent_lows.iloc[3]):
-                    patterns.append("潛在頭肩頂形態")
-            if len(self.data) >= 5:
-                closes = self.data['Close'].tail(5)
-                if (closes.iloc[0] > closes.iloc[1] < closes.iloc[2] and
-                    closes.iloc[2] > closes.iloc[3] < closes.iloc[4] and
-                    closes.iloc[1] < closes.iloc[3] and closes.iloc[4] > closes.iloc[2]):
-                    patterns.append("潛在雙底 (W 底)")
-            if len(self.data) >= 5:
-                closes = self.data['Close'].tail(5)
-                if (closes.iloc[0] < closes.iloc[1] > closes.iloc[2] and
-                    closes.iloc[2] < closes.iloc[3] > closes.iloc[4] and
-                    closes.iloc[1] > closes.iloc[3] and closes.iloc[4] < closes.iloc[2]):
-                    patterns.append("潛在雙頂 (M 頂)")
-            if len(self.data) >= 10:
-                recent_highs = self.data['High'].tail(10)
-                recent_lows = self.data['Low'].tail(10)
-                high_mean = recent_highs.mean()
-                high_std = recent_highs.std()
-                if (high_std < 0.02 * high_mean and
-                    recent_lows.iloc[-1] > recent_lows.iloc[-3] > recent_lows.iloc[-5]):
-                    patterns.append("潛在上升三角形")
-            if len(self.data) >= 10:
-                recent_highs = self.data['High'].tail(10)
-                recent_lows = self.data['Low'].tail(10)
-                low_mean = recent_lows.mean()
-                low_std = recent_lows.std()
-                if (low_std < 0.02 * low_mean and
-                    recent_highs.iloc[-1] < recent_highs.iloc[-3] < recent_highs.iloc[-5]):
-                    patterns.append("潛在下降三角形")
+            df = self.data.tail(days).copy()
+            patterns = []
+            
+            # 黃金交叉 (MA5 上穿 MA20)
+            if (df['MA5'].iloc[-2] <= df['MA20'].iloc[-2]) and (df['MA5'].iloc[-1] > df['MA20'].iloc[-1]):
+                patterns.append("黃金交叉 (短期均線上穿長期均線)")
+            
+            # 死亡交叉 (MA5 下穿 MA20)
+            if (df['MA5'].iloc[-2] >= df['MA20'].iloc[-2]) and (df['MA5'].iloc[-1] < df['MA20'].iloc[-1]):
+                patterns.append("死亡交叉 (短期均線下穿長期均線)")
+            
+            # 突破布林帶上軌
+            if df['Close'].iloc[-1] > df['BB_upper'].iloc[-1] and df['Close'].iloc[-2] <= df['BB_upper'].iloc[-2]:
+                patterns.append("突破布林帶上軌 (可能超買)")
+            
+            # 跌破布林帶下軌
+            if df['Close'].iloc[-1] < df['BB_lower'].iloc[-1] and df['Close'].iloc[-2] >= df['BB_lower'].iloc[-2]:
+                patterns.append("跌破布林帶下軌 (可能超賣)")
+            
+            # MACD 金叉
+            if (df['MACD'].iloc[-2] <= df['MACD_signal'].iloc[-2]) and (df['MACD'].iloc[-1] > df['MACD_signal'].iloc[-1]):
+                patterns.append("MACD 金叉 (看漲信號)")
+            
+            # MACD 死叉
+            if (df['MACD'].iloc[-2] >= df['MACD_signal'].iloc[-2]) and (df['MACD'].iloc[-1] < df['MACD_signal'].iloc[-1]):
+                patterns.append("MACD 死叉 (看跌信號)")
+            
+            # KDJ 金叉
+            if (df['K'].iloc[-2] <= df['D'].iloc[-2]) and (df['K'].iloc[-1] > df['D'].iloc[-1]):
+                patterns.append("KDJ 金叉 (看漲信號)")
+            
+            # KDJ 死叉
+            if (df['K'].iloc[-2] >= df['D'].iloc[-2]) and (df['K'].iloc[-1] < df['D'].iloc[-1]):
+                patterns.append("KDJ 死叉 (看跌信號)")
+            
+            # RSI 超買
+            if df['RSI'].iloc[-1] > 70:
+                patterns.append("RSI 超買 (可能即將回檔)")
+            
+            # RSI 超賣
+            if df['RSI'].iloc[-1] < 30:
+                patterns.append("RSI 超賣 (可能即將反彈)")
+            
+            # 頭肩頂形態 (簡化版)
+            if len(df) >= 20:
+                recent_highs = df['High'].rolling(5).max()
+                if (recent_highs.iloc[-20] < recent_highs.iloc[-15] > recent_highs.iloc[-10] < recent_highs.iloc[-5] > recent_highs.iloc[-1]):
+                    patterns.append("可能形成頭肩頂形態 (看跌)")
+            
+            # 頭肩底形態 (簡化版)
+            if len(df) >= 20:
+                recent_lows = df['Low'].rolling(5).min()
+                if (recent_lows.iloc[-20] > recent_lows.iloc[-15] < recent_lows.iloc[-10] > recent_lows.iloc[-5] < recent_lows.iloc[-1]):
+                    patterns.append("可能形成頭肩底形態 (看漲)")
+            
+            # 雙頂形態 (簡化版)
+            if len(df) >= 15:
+                recent_highs = df['High'].rolling(3).max()
+                if abs(recent_highs.iloc[-15] - recent_highs.iloc[-5]) / recent_highs.iloc[-15] < 0.03 and recent_highs.iloc[-10] < recent_highs.iloc[-15]:
+                    patterns.append("可能形成雙頂形態 (看跌)")
+            
+            # 雙底形態 (簡化版)
+            if len(df) >= 15:
+                recent_lows = df['Low'].rolling(3).min()
+                if abs(recent_lows.iloc[-15] - recent_lows.iloc[-5]) / recent_lows.iloc[-15] < 0.03 and recent_lows.iloc[-10] > recent_lows.iloc[-15]:
+                    patterns.append("可能形成雙底形態 (看漲)")
+            
+            return patterns
         except Exception as e:
             logging.error("識別技術形態時發生錯誤: %s", e)
-        return patterns
+            return ["無法識別技術形態"]
 
-    def get_recent_news(self, days=30, num_news=10):
+    def _generate_chart(self, days=180):
+        """生成股票走勢圖"""
         try:
-            if self.market == "TW":
-                query = self.ticker.replace('.TW', '')
-            else:
-                query = self.company_name if self.company_name else self.ticker
-            encoded_query = urllib.parse.quote(query)
-            if self.market == "TW":
-                rss_url = f"https://news.google.com/rss/search?q={encoded_query}+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-            else:
-                rss_url = f"https://news.google.com/rss/search?q={encoded_query}+stock&hl=en-US&gl=US&ceid=US:en"
+            df = self.data.tail(days).copy()
+            
+            # 創建子圖
+            fig = make_subplots(rows=4, cols=1, 
+                               shared_xaxes=True, 
+                               vertical_spacing=0.05, 
+                               row_heights=[0.5, 0.15, 0.15, 0.2])
+            
+            # 添加K線圖
+            fig.add_trace(go.Candlestick(
+                x=df.index,
+                open=df['Open'],
+                high=df['High'],
+                low=df['Low'],
+                close=df['Close'],
+                name='K線'
+            ), row=1, col=1)
+            
+            # 添加移動平均線
+            fig.add_trace(go.Scatter(x=df.index, y=df['MA5'], name='MA5', line=dict(color='orange', width=1)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], name='MA20', line=dict(color='blue', width=1)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['MA120'], name='MA120', line=dict(color='green', width=1)), row=1, col=1)
+            
+            # 添加布林帶
+            fig.add_trace(go.Scatter(x=df.index, y=df['BB_upper'], name='布林上軌', line=dict(color='rgba(173, 204, 255, 0.7)', width=1)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['BB_lower'], name='布林下軌', line=dict(color='rgba(173, 204, 255, 0.7)', width=1, dash='dash')), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['BB_middle'], name='布林中軌', line=dict(color='rgba(173, 204, 255, 0.7)', width=1)), row=1, col=1)
+            
+            # 添加成交量
+            colors = ['red' if df['Close'].iloc[i] > df['Open'].iloc[i] else 'green' for i in range(len(df))]
+            fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='成交量', marker_color=colors), row=2, col=1)
+            
+            # 添加MACD
+            fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], name='MACD', line=dict(color='blue', width=1)), row=3, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['MACD_signal'], name='MACD信號', line=dict(color='red', width=1)), row=3, col=1)
+            
+            colors = ['red' if val >= 0 else 'green' for val in df['MACD_hist']]
+            fig.add_trace(go.Bar(x=df.index, y=df['MACD_hist'], name='MACD柱狀', marker_color=colors), row=3, col=1)
+            
+            # 添加KDJ
+            fig.add_trace(go.Scatter(x=df.index, y=df['K'], name='K值', line=dict(color='blue', width=1)), row=4, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['D'], name='D值', line=dict(color='red', width=1)), row=4, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['J'], name='J值', line=dict(color='green', width=1)), row=4, col=1)
+            
+            # 更新佈局
+            fig.update_layout(
+                title=f'{self.company_name} ({self.ticker}) 技術分析圖',
+                xaxis_rangeslider_visible=False,
+                template='plotly_dark',
+                height=800,
+                width=1000,
+                margin=dict(l=50, r=50, t=80, b=50),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0.2)',
+                font=dict(color='white')
+            )
+            
+            # 更新Y軸格式
+            fig.update_yaxes(title_text='價格', row=1, col=1)
+            fig.update_yaxes(title_text='成交量', row=2, col=1)
+            fig.update_yaxes(title_text='MACD', row=3, col=1)
+            fig.update_yaxes(title_text='KDJ', row=4, col=1)
+            
+            # 保存圖表
+            chart_path = f"static/charts/{self.ticker.replace('.', '_')}_chart.html"
+            fig.write_html(chart_path)
+            
+            return chart_path
+        except Exception as e:
+            logging.error("生成圖表時發生錯誤: %s", e)
+            raise
+
+    def get_stock_summary(self):
+        """獲取股票綜合分析"""
+        try:
+            # 計算技術指標
+            latest = self.data.iloc[-1]
+            prev = self.data.iloc[-2]
+            
+            # 計算漲跌幅
+            price_change = ((latest['Close'] - prev['Close']) / prev['Close']) * 100
+            price_change_str = f"{price_change:.2f}%"
+            
+            # 獲取技術形態
+            patterns = self._identify_patterns()
+            
+            # 生成圖表
+            chart_path = self._generate_chart()
+            
+            # 獲取最新新聞
+            news = self._get_stock_news()
+            
+            # 生成AI分析
+            analysis = self._get_ai_analysis()
+            
+            return {
+                "ticker": self.ticker,
+                "company_name": self.company_name,
+                "currency": self.currency,
+                "current_price": latest['Close'],
+                "price_change": price_change_str,
+                "price_change_value": price_change,
+                "volume": latest['Volume'],
+                "pe_ratio": self.pe_ratio,
+                "market_cap": self.market_cap,
+                "eps": self.eps,
+                "roe": self.roe if isinstance(self.roe, str) else f"{self.roe:.2%}" if self.roe is not None else "N/A",
+                "net_profit_margin": self.net_profit_margin_str,
+                "current_ratio": self.current_ratio_str,
+                "rsi": latest['RSI'],
+                "macd": latest['MACD'],
+                "macd_signal": latest['MACD_signal'],
+                "k": latest['K'],
+                "d": latest['D'],
+                "j": latest['J'],
+                "patterns": patterns,
+                "chart_path": chart_path,
+                "news": news,
+                "analysis": analysis
+            }
+        except Exception as e:
+            logging.error("獲取股票綜合分析時發生錯誤: %s", e)
+            raise
+
+    def _get_stock_news(self, max_news=5):
+        """獲取相關股票新聞"""
+        try:
+            # 使用 Google News RSS
+            search_term = f"{self.company_name} stock" if self.market == "US" else f"{self.company_name} 股票"
+            rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(search_term)}&hl={'en-US' if self.market == 'US' else 'zh-TW'}&gl={'US' if self.market == 'US' else 'TW'}&ceid={'US:en' if self.market == 'US' else 'TW:zh-Hant'}"
+            
             feed = feedparser.parse(rss_url)
-            recent_news = []
-            now = dt.datetime.now()
-            for entry in feed.entries:
+            news_list = []
+            
+            for entry in feed.entries[:max_news]:
                 try:
                     published_time = dt.datetime(*entry.published_parsed[:6])
-                except Exception:
-                    published_time = now
-                if (now - published_time).days <= days:
+                    
+                    # 使用 FinBERT 進行情緒分析
+                    result = self.sentiment_analyzer(entry.title)[0]
+                    
                     news_entry = {
                         'title': entry.title,
                         'link': entry.link,
                         'date': published_time.strftime('%Y-%m-%d'),
-                        'source': entry.get('source', {}).get('title', 'Google News')
+                        'source': entry.source.title if hasattr(entry, 'source') else 'Google News',
+                        'sentiment': result['label'],
+                        'sentiment_score': result['score']
                     }
-                    try:
-                        sentiment = self.sentiment_analyzer(entry.title)[0]
-                        news_entry['sentiment'] = sentiment['label']
-                        news_entry['sentiment_score'] = sentiment['score']
-                    except Exception as e:
-                        logging.error("情緒分析失敗: %s", e)
-                        news_entry['sentiment'] = 'N/A'
-                        news_entry['sentiment_score'] = 0
-                    recent_news.append(news_entry)
-                    if len(recent_news) >= num_news:
-                        break
-            if not recent_news:
-                return self._get_fallback_news()
-            return recent_news
+                    
+                    news_list.append(news_entry)
+                except Exception as inner_e:
+                    logging.error(f"處理新聞條目時發生錯誤: {inner_e}")
+                    continue
+                    
+            return news_list
         except Exception as e:
-            logging.error("取得近期新聞時發生錯誤: %s", e)
-            return self._get_fallback_news()
+            logging.error(f"獲取股票新聞時發生錯誤: {e}")
+            return []
 
-    def _get_fallback_news(self):
+    def _get_ai_analysis(self):
+        """使用Gemini生成AI分析"""
         try:
-            now_str = dt.datetime.now().strftime('%Y-%m-%d')
-            if self.market == "TW":
-                return [{
-                    'title': f'請訪問 Yahoo 股市或工商時報查看 {self.ticker} 的最新新聞',
-                    'date': now_str,
-                    'source': '系統訊息',
-                    'link': f'https://tw.stock.yahoo.com/quote/{self.ticker.replace(".TW", "")}/news',
-                    'sentiment': 'N/A',
-                    'sentiment_score': 0
-                }]
-            else:
-                return [{
-                    'title': f'請訪問 Yahoo Finance 或 MarketWatch 查看 {self.ticker} 的最新新聞',
-                    'date': now_str,
-                    'source': '系統訊息',
-                    'link': f'https://finance.yahoo.com/quote/{self.ticker}/news',
-                    'sentiment': 'N/A',
-                    'sentiment_score': 0
-                }]
-        except Exception as e:
-            logging.error("備用新聞方法發生錯誤: %s", e)
-            return [{
-                'title': '暫時無法獲取相關新聞',
-                'date': dt.datetime.now().strftime('%Y-%m-%d'),
-                'source': '系統訊息',
-                'link': '#',
-                'sentiment': 'N/A',
-                'sentiment_score': 0
-            }]
-
-    def generate_strategy(self):
-        try:
-            last_row = self.data.iloc[-1]
-            sentiment_summary = [news['sentiment'] for news in self.get_recent_news()]
-            positive_count = sentiment_summary.count('Positive')
-            negative_count = sentiment_summary.count('Negative')
-            total_news = len(sentiment_summary)
-            sentiment_ratio = (positive_count - negative_count) / total_news if total_news > 0 else 0
-            if last_row['RSI'] < 30 and last_row['MACD'] > last_row['MACD_signal'] and sentiment_ratio > 0:
-                return "Buy"
-            elif last_row['RSI'] > 70 and sentiment_ratio < 0:
-                return "Sell"
-            else:
-                return "Hold"
-        except Exception as e:
-            logging.error("生成策略時發生錯誤: %s", e)
-            return "Hold"
-
-
-
-    def plot_analysis(self, days=180, ma_lines=['MA5', 'MA20', 'MA120', 'MA240']):
-        try:
-            # 取出最近 days 天的資料
-            plot_data = self.data.tail(days).copy()
+            latest = self.data.iloc[-1]
+            prev_day = self.data.iloc[-2]
+            prev_week = self.data.iloc[-6] if len(self.data) >= 6 else self.data.iloc[0]
+            prev_month = self.data.iloc[-23] if len(self.data) >= 23 else self.data.iloc[0]
             
-            # 子圖配置
-            specs = [
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": True}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-            ]
+            # 計算各種漲跌幅
+            daily_change = ((latest['Close'] - prev_day['Close']) / prev_day['Close']) * 100
+            weekly_change = ((latest['Close'] - prev_week['Close']) / prev_week['Close']) * 100
+            monthly_change = ((latest['Close'] - prev_month['Close']) / prev_month['Close']) * 100
             
-            # 建立 8x1 的子圖佈局
-            fig = make_subplots(
-                rows=8, 
-                cols=1, 
-                shared_xaxes=True,
-                vertical_spacing=0.03,
-                subplot_titles=(
-                    "價格與均線", "RSI", "MACD", "KDJ", 
-                    "Williams %R", "PSY & VR", "BIAS", "AR & BR"
-                ),
-                row_heights=[0.35, 0.10, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15],
-                specs=specs
-            )
-            
-            # 蠟燭圖 -> 不顯示在圖例
-            fig.add_trace(
-                go.Candlestick(
-                    x=plot_data.index, 
-                    open=plot_data['Open'], 
-                    high=plot_data['High'],
-                    low=plot_data['Low'], 
-                    close=plot_data['Close'], 
-                    name='蠟燭圖',
-                    showlegend=False
-                ), 
-                row=1, 
-                col=1
-            )
-            
-            # MA 顏色對應表
-            ma_colors = {'MA5': 'blue', 'MA20': 'orange', 'MA120': 'purple', 'MA240': 'brown'}
-            
-            # 繪製 MA 線 -> 保留在圖例
-            for ma in ma_lines:
-                if ma in plot_data.columns:
-                    color = ma_colors.get(ma, 'black')
-                    label = ma if ma not in ['MA120', 'MA240'] else (
-                        f"{ma} (半年線)" if ma == 'MA120' else f"{ma} (年線)"
-                    )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=plot_data.index, 
-                            y=plot_data[ma], 
-                            mode='lines', 
-                            name=label,
-                            line=dict(color=color, width=1),
-                            showlegend=True
-                        ), 
-                        row=1, 
-                        col=1
-                    )
-            
-            # 布林通道 -> 保留在圖例
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['BB_upper'], 
-                    mode='lines', 
-                    name='BB 上軌',
-                    line=dict(color='grey', width=1),
-                    showlegend=True
-                ), 
-                row=1, 
-                col=1
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['BB_lower'], 
-                    mode='lines', 
-                    name='BB 下軌',
-                    line=dict(color='grey', width=1),
-                    showlegend=True
-                ), 
-                row=1, 
-                col=1
-            )
-            
-            # RSI -> 不顯示在圖例
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['RSI'], 
-                    mode='lines', 
-                    name='RSI',
-                    line=dict(color='purple', width=1),
-                    showlegend=False
-                ), 
-                row=2, 
-                col=1
-            )
-            fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="超買", row=2, col=1)
-            fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="超賣", row=2, col=1)
-            
-            # MACD -> 不顯示在圖例
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['MACD'], 
-                    mode='lines', 
-                    name='MACD',
-                    line=dict(color='blue', width=1),
-                    showlegend=False
-                ), 
-                row=3, 
-                col=1
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['MACD_signal'], 
-                    mode='lines', 
-                    name='MACD Signal',
-                    line=dict(color='orange', width=1),
-                    showlegend=False
-                ), 
-                row=3, 
-                col=1
-            )
-            macd_hist = plot_data['MACD'] - plot_data['MACD_signal']
-            fig.add_trace(
-                go.Bar(
-                    x=plot_data.index, 
-                    y=macd_hist, 
-                    name='MACD Histogram', 
-                    marker_color='grey', 
-                    opacity=0.5,
-                    showlegend=False
-                ),
-                row=3, 
-                col=1
-            )
-            
-            # KDJ -> 不顯示在圖例
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['K'], 
-                    mode='lines', 
-                    name='K',
-                    line=dict(color='blue', width=1),
-                    showlegend=False
-                ), 
-                row=4, 
-                col=1
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['D'], 
-                    mode='lines', 
-                    name='D',
-                    line=dict(color='orange', width=1),
-                    showlegend=False
-                ), 
-                row=4, 
-                col=1
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['J'], 
-                    mode='lines', 
-                    name='J',
-                    line=dict(color='green', width=1),
-                    showlegend=False
-                ), 
-                row=4, 
-                col=1
-            )
-            
-            # Williams %R -> 不顯示在圖例
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['WMSR'], 
-                    mode='lines', 
-                    name='WMSR',
-                    line=dict(color='purple', width=1),
-                    showlegend=False
-                ), 
-                row=5, 
-                col=1
-            )
-            fig.add_hline(y=-20, line_dash="dash", line_color="red", annotation_text="超買", row=5, col=1)
-            fig.add_hline(y=-80, line_dash="dash", line_color="green", annotation_text="超賣", row=5, col=1)
-            
-            # PSY & VR -> 不顯示在圖例
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['PSY'], 
-                    mode='lines', 
-                    name='PSY',
-                    line=dict(color='blue', width=1),
-                    showlegend=False
-                ), 
-                row=6, 
-                col=1, 
-                secondary_y=False
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['VR'], 
-                    mode='lines', 
-                    name='VR',
-                    line=dict(color='orange', width=1),
-                    showlegend=False
-                ), 
-                row=6, 
-                col=1, 
-                secondary_y=True
-            )
-            fig.update_yaxes(title_text="PSY", row=6, col=1, secondary_y=False)
-            fig.update_yaxes(title_text="VR", row=6, col=1, secondary_y=True)
-            
-            # BIAS -> 不顯示在圖例
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['BIAS6'], 
-                    mode='lines', 
-                    name='BIAS6',
-                    line=dict(color='green', width=1),
-                    showlegend=False
-                ), 
-                row=7, 
-                col=1
-            )
-            fig.add_hline(y=5, line_dash="dash", line_color="red", annotation_text="超買", row=7, col=1)
-            fig.add_hline(y=-5, line_dash="dash", line_color="green", annotation_text="超賣", row=7, col=1)
-            
-            # AR & BR -> 不顯示在圖例
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['AR'], 
-                    mode='lines', 
-                    name='AR',
-                    line=dict(color='blue', width=1),
-                    showlegend=False
-                ), 
-                row=8, 
-                col=1
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_data.index, 
-                    y=plot_data['BR'], 
-                    mode='lines', 
-                    name='BR',
-                    line=dict(color='orange', width=1),
-                    showlegend=False
-                ), 
-                row=8, 
-                col=1
-            )
-            
-            # 更新整體佈局
-            fig.update_layout(
-                title={'text': f"{self.company_name} ({self.ticker}) 技術分析圖表", 'x': 0.5,  'y': 0.95,'xanchor': 'center'},
-                height=1800,
-                width=1000,
-                margin=dict(l=50, r=50, t=80, b=50),
-                legend=dict(
-                    orientation="h", 
-                    yanchor="bottom", 
-                    y=1.02, 
-                    xanchor="right", 
-                    x=1
-                ),
-                template="plotly_white", 
-                showlegend=True
-            )
-           
-            
-            # 關閉下方自動生成的 X 軸縮放區塊
-            fig.update_xaxes(rangeslider_visible=False)
-            
-            # 更新各子圖的 Y 軸標題
-            fig.update_yaxes(title_text=f"價格 ({self.currency})", row=1, col=1)
-            fig.update_yaxes(title_text="RSI", row=2, col=1)
-            fig.update_yaxes(title_text="MACD", row=3, col=1)
-            fig.update_yaxes(title_text="KDJ", row=4, col=1)
-            fig.update_yaxes(title_text="WMSR", row=5, col=1)
-            fig.update_yaxes(title_text="BIAS", row=7, col=1)
-            fig.update_yaxes(title_text="AR & BR", row=8, col=1)
-            
-            # 儲存為 HTML 檔
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            file_name = f"{self.ticker}_full_analysis_{timestamp}.html"
-            html_path = os.path.join('static', 'charts', file_name)
-            fig.write_html(html_path)
-            
-            logging.info("完整指標圖表生成並儲存至 %s", html_path)
-            return html_path
-
-        except Exception as e:
-            logging.error("生成完整指標圖表時發生錯誤: %s", e)
-            raise
-
-    def format_market_cap(self):
-        if self.market_cap == 'N/A' or not isinstance(self.market_cap, (int, float)):
-            return 'N/A'
-        value = float(self.market_cap)
-        units_tw = ['元', '萬', '億', '兆']
-        units_us = ['USD', '萬', '億', '兆']
-        units = units_tw if self.currency == 'TWD' else units_us
-        divisor = 1
-        unit_idx = 0
-        while value >= 10000 and unit_idx < len(units) - 1:
-            value /= 10000
-            unit_idx += 1
-            divisor *= 10000
-        return f"{value:.2f} {units[unit_idx]} {self.currency}"
-
-    def generate_ai_analysis(self, days=180):
-        try:
-            if len(self.data) < 2:
-                raise ValueError("數據不足，無法計算價格變動。")
-            last_price = self.data['Close'].iloc[-1]
-            prev_price = self.data['Close'].iloc[-2]
-            price_change = ((last_price - prev_price) / prev_price * 100) if prev_price else 0
-            recent_news = self.get_recent_news()
-            news_summary = "\n".join([f"- [{news['date']}] {news['title']} (來源: {news['source']}, 情緒: {news['sentiment']})" 
-                                    for news in recent_news])
-            technical_status = {
-                'last_price': last_price,
-                'price_change': price_change,
-                'rsi': self.data['RSI'].iloc[-1],
-                'ma5': self.data['MA5'].iloc[-1],
-                'ma20': self.data['MA20'].iloc[-1],
-                'ma120': self.data['MA120'].iloc[-1],
-                'ma240': self.data['MA240'].iloc[-1],
-                'bb_upper': self.data['BB_upper'].iloc[-1],
-                'bb_lower': self.data['BB_lower'].iloc[-1],
-                'macd': self.data['MACD'].iloc[-1],
-                'macd_signal': self.data['MACD_signal'].iloc[-1],
-                'kdj_k': self.data['K'].iloc[-1],
-                'kdj_d': self.data['D'].iloc[-1],
-                'kdj_j': self.data['J'].iloc[-1],
-                'patterns': self.identify_patterns(),
-                'fib_levels': self.calculate_fibonacci_levels(),
-                'financial_head': self.financials_head
-            }
+            # 準備提示詞
             prompt = f"""
-你是一位擁有三十年經驗的專業股市分析師，請根據以下 {self.company_name} ({self.ticker}) 的數據和技術指標進行深入的股市分析，並使用專業術語（如動能、趨勢、波動性）解釋其影響(不要透漏自己得身分，開頭直接:以下是針對(股票名稱)股票的分析，然後幫我排版排好一點)：
-
-【基本資訊】
-- 公司名稱: {self.company_name}
-- 股票代碼: {self.ticker}
-- 最新收盤價: {last_price:.2f} {self.currency}
-- 日漲跌: {price_change:.2f}%
-
-【財務數據】
-- 市盈率 (Trailing P/E): {self.pe_ratio}
-- 市值: {self.format_market_cap()}
-- 預期市盈率 (Forward P/E): {self.forward_pe}
-- 利潤率: {self.profit_margins}
-- EPS: {self.eps}
-- ROE: {self.roe}
-
-【技術指標】
-- RSI(14): {technical_status['rsi']:.2f}
-- MA5: {technical_status['ma5']:.2f}
-- MA20: {technical_status['ma20']:.2f}
-- MA120 (半年線): {technical_status['ma120']:.2f}
-- MA240 (年線): {technical_status['ma240']:.2f}
-- 布林帶上軌: {technical_status['bb_upper']:.2f}
-- 布林帶下軌: {technical_status['bb_lower']:.2f}
-- MACD: {technical_status['macd']:.2f}
-- MACD Signal: {technical_status['macd_signal']:.2f}
-- KDJ (K/D/J): {technical_status['kdj_k']:.2f}/{technical_status['kdj_d']:.2f}/{technical_status['kdj_j']:.2f}
-- WMSR (Williams %R): {self.data['WMSR'].iloc[-1]:.2f}
-- PSY: {self.data['PSY'].iloc[-1]:.2f}
-- VR: {self.data['VR'].iloc[-1]:.2f}
-- BIAS6: {self.data['BIAS6'].iloc[-1]:.2f}
-- AR: {self.data['AR'].iloc[-1]:.2f}
-- BR: {self.data['BR'].iloc[-1]:.2f}
-
-【技術形態】
-- {', '.join(technical_status['patterns']) if technical_status['patterns'] else '無明顯技術形態'}
-
-【Fibonacci 回檔水平】
-- {', '.join([f"{k}: {v:.2f}" for k, v in technical_status['fib_levels'].items()])}
-
-【近期新聞】
-{news_summary}
-
-請按以下結構提供分析：
-1. 近期價格走勢評估（分析動能與趨勢）
-2. 支撐與壓力位分析（可根據Fibonacci、布林帶還有均線）
-3. 短期走勢預測（基於 MACD、RSI 和 KDJ 或其他指標，其他指標盡量只使用非中性有明顯訊號的）
-4. 策略建議與風險分析（提供買入、賣出或持有建議，並說明理由）
-5. 講解該股票近期相關新聞並對其的影響分析（結合情緒分析）
-6. 綜合分析給出結論（可加入給你的其他數據或個人見解）
-
-具體要求：
-- 解釋 RSI 的超買超賣情況
-- 分析 MACD 的趨勢信號
-- 評估 KDJ 的買賣信號
-- 描述布林帶的價格波動性
-- 可適度加入 PSY、VR、BIAS、AR、BR、WMSR 指標解讀
-
-最後，請在分析報告的結尾加入以下免責聲明：
-"本分析報告僅供參考，不構成投資建議。投資者應自行承擔投資風險。"
+            請分析以下股票數據並提供專業的投資建議：
+            
+            股票：{self.company_name} ({self.ticker})
+            市場：{'台股' if self.market == 'TW' else '美股'}
+            當前價格：{latest['Close']} {self.currency}
+            
+            技術指標：
+            - RSI: {latest['RSI']:.2f}
+            - MACD: {latest['MACD']:.4f}
+            - KD值: K={latest['K']:.2f}, D={latest['D']:.2f}
+            - 布林帶: 上軌={latest['BB_upper']:.2f}, 中軌={latest['BB_middle']:.2f}, 下軌={latest['BB_lower']:.2f}
+            
+            價格變動：
+            - 日漲跌: {daily_change:.2f}%
+            - 週漲跌: {weekly_change:.2f}%
+            - 月漲跌: {monthly_change:.2f}%
+            
+            基本面數據：
+            - 本益比(P/E): {self.pe_ratio if isinstance(self.pe_ratio, str) else f"{self.pe_ratio:.2f}" if self.pe_ratio is not None else "N/A"}
+            - 市值: {self.market_cap if isinstance(self.market_cap, str) else f"{self.market_cap:,}" if self.market_cap is not None else "N/A"}
+            - EPS: {self.eps if isinstance(self.eps, str) else f"{self.eps:.2f}" if self.eps is not None else "N/A"}
+            - ROE: {self.roe if isinstance(self.roe, str) else f"{self.roe:.2%}" if self.roe is not None else "N/A"}
+            - 淨利潤率: {self.net_profit_margin_str}
+            - 流動比率: {self.current_ratio_str}
+            
+            請提供以下分析：
+            1. 技術面分析：目前股價位於什麼位置？技術指標顯示什麼信號？
+            2. 基本面分析：公司財務狀況如何？估值是否合理？
+            3. 短期展望（1-4週）
+            4. 中長期展望（1-6個月）
+            5. 投資建議（買入/賣出/持有）及理由
+            
+            請簡潔有力地回答，使用繁體中文，並注意分析的專業性和客觀性。
             """
+            
             response = self.model.generate_content(prompt)
-            response_text = response.text.replace('\n', '<br>')
-            return response_text
+            analysis = response.text
+            
+            return analysis
         except Exception as e:
-            logging.error("生成 AI 分析時發生錯誤: %s", e)
-            return f"生成 AI 分析時發生錯誤: {str(e)}"
-        
-    def generate_financial_analysis(self, days=180):
-        try:
-            prompt = f"""
-你是一位擁有三十年經驗的專業財金分析師，請根據以下 {self.company_name} ({self.ticker}) 的數據和財務數據進行深入的分析，若有數據缺失的部分就無需提及，並使用專業術語解釋(不要透漏自己得身分，開頭直接:以下是針對(股票名稱)的分析，然後幫我排版排好一點)：以下是針對 {self.company_name} ({self.ticker}) 的財務分析：
+            logging.error(f"生成AI分析時發生錯誤: {e}")
+            return "無法生成AI分析，請稍後再試。"
 
-請按以下結構提供分析：
-請根據以下財務數據進行深入分析，並評估該公司的盈利能力、成長性、流動性及潛在風險，
-1. 財務健康狀況評估（分析盈利能力、流動性和負債情況）
-2. 成長性分析 (根據過去幾年的財務數據評估公司的成長性)
-3. 估值分析（基於市盈率和預期市盈率）
-4. 風險（根據財務數據的內容說明潛在財務風險）
-5. 綜合結論
-
-【基本資訊】
-- 公司名稱: {self.company_name}
-- 股票代碼: {self.ticker}
-
-【財務指標】
-- 淨利率: {self.net_profit_margin_str}
-- 流動比率: {self.current_ratio_str}
-- 市盈率 (Trailing P/E): {self.pe_ratio}
-- 預期市盈率 (Forward P/E): {self.forward_pe}
-- 利潤率: {self.profit_margins}
-- EPS: {self.eps}
-- ROE: {self.roe}
-- 年度損益表:\n{self.financials_head}
-- 年度資產負債表:\n{self.balance_sheet_head}
-- 年度現金流量表:\n{self.cashflow_head}
-
-
-
-最後，請在分析報告的結尾加入以下免責聲明：
-"本分析報告僅供參考，不構成投資建議。投資者應自行承擔投資風險。"
-            """
-            response = self.model.generate_content(prompt)
-            response_text = response.text.replace('\n', '<br>')
-            return response_text
-        except Exception as e:
-            logging.error("生成財務分析時發生錯誤: %s", e)
-            return f"生成財務分析時發生錯誤: {str(e)}"
-        
-    def run_full_analysis(self, days_to_analyze=180, ma_lines=['MA5', 'MA20', 'MA120', 'MA240']):
-        try:
-            ai_analysis = self.generate_ai_analysis(days_to_analyze)
-            financial_analysis = self.generate_financial_analysis(days_to_analyze)
-            chart_path = self.plot_analysis(days_to_analyze, ma_lines)
-            strategy = self.generate_strategy()
-            score, label = self._calculate_sentiment_score()
-            gauge_path = self._plot_gauge(score, label)
-            last_row = self.data.iloc[-1]
-            summary = {
-                "company_name": self.company_name,
-                "ticker": self.ticker,
-                "close_price": float(last_row['Close']),
-                "open_price": float(last_row['Open']),
-                "high_price": float(last_row['High']),
-                "low_price": float(last_row['Low']),
-                "currency": self.currency,
-                "rsi": float(last_row['RSI']),
-                "ma5": float(last_row['MA5']),
-                "ma20": float(last_row['MA20']),
-                "ma120": float(last_row['MA120']),
-                "ma240": float(last_row['MA240']),
-                "bb_upper": float(last_row['BB_upper']),
-                "bb_lower": float(last_row['BB_lower']),
-                "macd": float(last_row['MACD']),
-                "macd_signal": float(last_row['MACD_signal']),
-                "kdj_k": float(last_row['K']),
-                "kdj_d": float(last_row['D']),
-                "kdj_j": float(last_row['J']),
-                "wmsr": float(last_row['WMSR']),
-                "psy": float(last_row['PSY']),
-                "vr": float(last_row['VR']),
-                "bias6": float(last_row['BIAS6']),
-                "ar": float(last_row['AR']),
-                "br": float(last_row['BR']),
-                "patterns": self.identify_patterns(),
-                "fib_levels": {k: float(v) for k, v in self.calculate_fibonacci_levels().items()},
-                "strategy": strategy,
-                "pe_ratio": self.pe_ratio,
-                "market_cap": self.format_market_cap(),
-                "forward_pe": self.forward_pe,
-                "eps": self.eps,
-                "sentiment_score": score,
-                "sentiment_label": label
-            }
-            timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-            result_file = os.path.join('static', 'data', f"{self.ticker}_analysis_{timestamp}.json")
-            with open(result_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'a_analysis': ai_analysis,
-                    'f_analysis': financial_analysis,
-                    'summary': summary,
-                    'chart_path': chart_path,
-                    'gauge_path': gauge_path,
-                    'timestamp': dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }, f, ensure_ascii=False, indent=4)
-            logging.info("JSON 結果儲存至 %s", result_file)
-            return {
-                'a_analysis': ai_analysis,
-                'f_analysis': financial_analysis,
-                'summary': summary,
-                'chart_path': chart_path,
-                'gauge_path': gauge_path,
-                'timestamp': dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-        except Exception as e:
-            logging.error("完整分析流程發生錯誤: %s", e)
-            raise
+# ------------------ API 路由 ------------------
 
 @app.route('/')
-def cover():
-    return render_template('cover.html')
-
-@app.route('/index')
 def index():
     return render_template('index.html')
 
-load_dotenv()
+@app.route('/analysis/<ticker>')
+def analysis(ticker):
+    market = request.args.get('market', 'TW')
+    return render_template('analysis.html', ticker=ticker, market=market)
 
-@app.route('/analyze', methods=['POST'])
-def analyze():
+@app.route('/api/analyze', methods=['POST'])
+def analyze_stock():
     try:
-        data = request.form
+        data = request.get_json()
         ticker = data.get('ticker', '').strip()
         market = data.get('market', 'TW')
-        period = '10y'
-        days = int(data.get('days', 180))
-        ma_lines = data.getlist('ma_lines')
-        api_key = os.getenv("GEMINI_API_KEY")
+        
         if not ticker:
-            return jsonify({'error': '請輸入股票代碼'}), 400
-        if not api_key:
-            return jsonify({'error': 'API 金鑰無效，請檢查 .env 設定'}), 500
-        analyzer = StockAnalyzer(ticker=ticker, api_key=api_key, period=period, market=market)
-        results = analyzer.run_full_analysis(days_to_analyze=days, ma_lines=ma_lines or ['MA5', 'MA20'])
-        timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-        result_file = f"static/data/{ticker}_analysis_{timestamp}.json"
-        with open(result_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=4)
-        session['last_analysis_file'] = result_file
-        logging.info("Session 更新，分析檔案: %s", result_file)
-        return jsonify({'status': 'success', 'redirect': '/results'})
+            return jsonify({'error': '請提供股票代碼'}), 400
+            
+        analyzer = StockAnalyzer(ticker, GEMINI_API_KEY, period="5y", market=market)
+        summary = analyzer.get_stock_summary()
+        
+        return jsonify({
+            'success': True,
+            'data': summary
+        })
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
-        logging.error("分析流程發生錯誤: %s", e)
-        return jsonify({'error': f"分析過程發生錯誤: {str(e)}"}), 500
+        logging.error("分析股票時發生錯誤: %s", e)
+        return jsonify({'error': f"分析股票時發生錯誤: {str(e)}"}), 500
 
-@app.route('/results')
-def results():
-    result_file = session.get('last_analysis_file')
-    if not result_file or not os.path.exists(result_file):
-        logging.warning("Session 中無分析檔案，或檔案不存在")
-        return redirect('/')
-    with open(result_file, 'r', encoding='utf-8') as f:
-        analysis_results = json.load(f)
-    os.remove(result_file)
-    session.pop('last_analysis_file', None)
-    return render_template('results.html', results=analysis_results)
-
-@app.route('/get_stock_change/<ticker>', methods=['GET'])
-def get_stock_change(ticker):
+@app.route('/api/chat', methods=['POST'])
+def chat():
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        change_percent = info.get('regularMarketChangePercent', 0)
-        return jsonify({'change': change_percent})
+        data = request.get_json()
+        message = data.get('message', '').strip()
+        market = data.get('market', 'TW')
+        
+        if not message:
+            return jsonify({'error': '請輸入訊息'}), 400
+            
+        # 檢查是否包含股票代碼查詢
+        stock_match = re.search(r'[#＃]([0-9A-Za-z\.]+)', message)
+        if stock_match:
+            ticker = stock_match.group(1)
+            try:
+                analyzer = StockAnalyzer(ticker, GEMINI_API_KEY, period="5y", market=market)
+                summary = analyzer.get_stock_summary()
+                
+                # 添加到追蹤清單
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor()
+                    # 暫時使用固定user_id=1，未來應整合登入系統
+                    user_id = 1
+                    
+                    # 檢查是否已存在
+                    cursor.execute('''
+                        SELECT id FROM watchlist 
+                        WHERE user_id = %s AND ticker = %s
+                    ''', (user_id, analyzer.ticker))
+                    
+                    if not cursor.fetchone():
+                        # 添加到追蹤清單
+                        cursor.execute('''
+                            INSERT INTO watchlist (user_id, ticker, name)
+                            VALUES (%s, %s, %s)
+                        ''', (user_id, analyzer.ticker, analyzer.company_name))
+                        conn.commit()
+                    
+                    cursor.close()
+                    conn.close()
+                
+                return jsonify({
+                    'success': True,
+                    'type': 'stock',
+                    'data': summary
+                })
+            except Exception as e:
+                logging.error(f"處理股票查詢時發生錯誤: {e}")
+                return jsonify({
+                    'success': True,
+                    'type': 'text',
+                    'data': f"無法查詢股票 {ticker}，請確認代碼是否正確。錯誤: {str(e)}"
+                })
+        
+        # 檢查是否為投資組合優化請求
+        if re.search(r'(投資|投組|資產|配置|組合).*(優化|建議|推薦|分配)', message):
+            try:
+                response = portfolio_model.generate_content(f"""
+                使用者想要投資組合優化建議。請詢問他們的風險承受度、投資期限和投資目標，
+                然後根據當前市場環境提供適合的資產配置建議。
+                
+                使用者的訊息: {message}
+                
+                請用繁體中文回覆，並提供具體的資產配置比例建議。
+                """)
+                
+                return jsonify({
+                    'success': True,
+                    'type': 'text',
+                    'data': response.text
+                })
+            except Exception as e:
+                logging.error(f"處理投資組合優化請求時發生錯誤: {e}")
+                return jsonify({
+                    'success': True,
+                    'type': 'text',
+                    'data': "無法處理投資組合優化請求，請稍後再試。"
+                })
+        
+        # 一般查詢，使用Gemini模型
+        try:
+            market_str = "台股" if market == "TW" else "美股"
+            response = general_model.generate_content(f"""
+            你是一位專業的股票分析師和投資顧問，專精於{market_str}市場分析。
+            使用者的訊息: {message}
+            
+            請用繁體中文回覆，提供專業、有見地且具體的回答。如果使用者詢問特定股票，
+            可以建議他們使用 #股票代碼 的格式來查詢詳細資訊。
+            """)
+            
+            return jsonify({
+                'success': True,
+                'type': 'text',
+                'data': response.text
+            })
+        except Exception as e:
+            logging.error(f"使用Gemini處理訊息時發生錯誤: {e}")
+            return jsonify({
+                'success': True,
+                'type': 'text',
+                'data': "抱歉，我無法處理您的請求，請稍後再試。"
+            })
     except Exception as e:
-        logging.error("取得股票漲跌幅錯誤: %s", e)
-        return jsonify({'error': str(e)}), 500
+        logging.error("處理聊天請求時發生錯誤: %s", e)
+        return jsonify({'error': f"處理聊天請求時發生錯誤: {str(e)}"}), 500
 
-if __name__ == "__main__":
-    app.run(debug=True)
+@app.route('/api/watchlist', methods=['GET'])
+def get_watchlist():
+    try:
+        # 從資料庫獲取資料
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': '無法連接資料庫'}), 500
+            
+        cursor = conn.cursor(dictionary=True)
+        
+        # 暫時使用固定user_id=1，未來應整合登入系統
+        user_id = 1
+        cursor.execute('''
+            SELECT w.ticker, w.name FROM watchlist w
+            WHERE w.user_id = %s
+        ''', (user_id,))
+        
+        watchlist_items = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        # 獲取最新價格數據
+        watchlist = []
+        for item in watchlist_items:
+            ticker = item['ticker']
+            try:
+                # 優先從資料庫獲取數據
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor(dictionary=True)
+                    cursor.execute('''
+                        SELECT close_price, open_price 
+                        FROM stocks 
+                        WHERE symbol = %s
+                    ''', (ticker,))
+                    
+                    stock_data = cursor.fetchone()
+                    cursor.close()
+                    conn.close()
+                    
+                    if stock_data and stock_data['close_price'] and stock_data['open_price']:
+                        price = stock_data['close_price']
+                        change = ((stock_data['close_price'] - stock_data['open_price']) / stock_data['open_price']) * 100
+                        
+                        watchlist.append({
+                            'ticker': ticker,
+                            'name': item['name'],
+                            'price': price,
+                            'change': change
+                        })
+                        continue
+                
+                # 如果資料庫中沒有數據，則從 yfinance 獲取
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period="2d")
+                if not hist.empty and len(hist) >= 2:
+                    current = hist.iloc[-1]
+                    prev = hist.iloc[-2]
+                    price = current['Close']
+                    change = ((current['Close'] - prev['Close']) / prev['Close']) * 100
+                else:
+                    price = 0
+                    change = 0
+                    
+                watchlist.append({
+                    'ticker': ticker,
+                    'name': item['name'],
+                    'price': price,
+                    'change': change
+                })
+            except Exception as e:
+                logging.error(f"獲取股票 {ticker} 數據時出錯: {e}")
+                # 添加錯誤項，但不中斷流程
+                watchlist.append({
+                    'ticker': ticker,
+                    'name': item['name'],
+                    'price': 0,
+                    'change': 0,
+                    'error': True
+                })
+        
+        return jsonify({'watchlist': watchlist})
+    except Exception as e:
+        logging.error(f"獲取追蹤清單時發生錯誤: {e}")
+        return jsonify({'error': f"獲取追蹤清單時發生錯誤: {str(e)}"}), 500
+
+@app.route('/api/watchlist/add', methods=['POST'])
+def add_to_watchlist():
+    try:
+        data = request.get_json()
+        ticker = data.get('ticker', '').strip()
+        name = data.get('name', '').strip()
+        
+        if not ticker:
+            return jsonify({'error': '請提供股票代碼'}), 400
+        
+        # 如果沒有提供名稱，嘗試獲取
+        if not name:
+            try:
+                stock = yf.Ticker(ticker)
+                info = stock.info
+                name = info.get('longName', ticker)
+            except:
+                name = ticker
+        
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': '無法連接資料庫'}), 500
+            
+        cursor = conn.cursor()
+        
+        # 暫時使用固定user_id=1，未來應整合登入系統
+        user_id = 1
+        
+        # 檢查是否已存在
+        cursor.execute('''
+            SELECT id FROM watchlist 
+            WHERE user_id = %s AND ticker = %s
+        ''', (user_id, ticker))
+        
+        if cursor.fetchone():
+            cursor.close()
+            conn.close()
+            return jsonify({'success': True, 'message': f'{name} 已在追蹤清單中'})
+        
+        # 添加到追蹤清單
+        cursor.execute('''
+            INSERT INTO watchlist (user_id, ticker, name)
+            VALUES (%s, %s, %s)
+        ''', (user_id, ticker, name))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({'success': True, 'message': f'已將 {name} 添加到追蹤清單'})
+    except Exception as e:
+        logging.error(f"添加到追蹤清單時發生錯誤: {e}")
+        return jsonify({'error': f"添加到追蹤清單時發生錯誤: {str(e)}"}), 500
+
+@app.route('/api/watchlist/remove', methods=['POST'])
+def remove_from_watchlist():
+    try:
+        data = request.get_json()
+        ticker = data.get('ticker', '').strip()
+        
+        if not ticker:
+            return jsonify({'error': '請提供股票代碼'}), 400
+            
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': '無法連接資料庫'}), 500
+            
+        cursor = conn.cursor()
+        
+        # 暫時使用固定user_id=1，未來應整合登入系統
+        user_id = 1
+        
+        # 獲取股票名稱用於回應訊息
+        cursor.execute('''
+            SELECT name FROM watchlist 
+            WHERE user_id = %s AND ticker = %s
+        ''', (user_id, ticker))
+        
+        result = cursor.fetchone()
+        if not result:
+            cursor.close()
+            conn.close()
+            return jsonify({'error': '該股票不在追蹤清單中'}), 404
+            
+        name = result[0]
+        
+        # 從追蹤清單中移除
+        cursor.execute('''
+            DELETE FROM watchlist 
+            WHERE user_id = %s AND ticker = %s
+        ''', (user_id, ticker))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({'success': True, 'message': f'已從追蹤清單中移除 {name}'})
+    except Exception as e:
+        logging.error(f"從追蹤清單移除時發生錯誤: {e}")
+        return jsonify({'error': f"從追蹤清單移除時發生錯誤: {str(e)}"}), 500
+
+@app.route('/api/portfolio/optimize', methods=['POST'])
+def optimize_portfolio():
+    try:
+        data = request.get_json()
+        
+        # 提取表單數據
+        risk_level = data.get('risk_level', 'moderate')
+        investment_amount = data.get('investment_amount', 10000)
+        investment_period = data.get('investment_period', '1-5')
+        investment_goal = data.get('investment_goal', 'growth')
+        
+        # 使用Gemini生成投資組合建議
+        prompt = f"""
+        請根據以下投資者信息提供詳細的投資組合配置建議：
+        
+        風險承受度：{risk_level}（保守/適中/積極）
+        投資金額：{investment_amount} 元
+        投資期限：{investment_period} 年
+        投資目標：{investment_goal}（收入/成長/平衡）
+        
+        請提供：
+        1. 資產類別配置比例（股票、債券、現金等）
+        2. 不同市場的分配比例（台股、美股、其他國際市場）
+        3. 具體的ETF或基金推薦（請提供實際代碼和名稱）
+        4. 投資策略建議（定期定額、價值投資等）
+        
+        回答需要具體、實用，並考慮當前市場環境。請用繁體中文回覆。
+        """
+        
+        response = portfolio_model.generate_content(prompt)
+        portfolio_suggestion = response.text
+        
+        # 生成一個模擬的投資組合分配圖
+        try:
+            # 解析AI回應中的資產配置比例
+            # 這裡使用簡單的正則表達式來提取百分比，實際應用中可能需要更複雜的解析
+            stocks_match = re.search(r'股票[：:]\s*(\d+)%', portfolio_suggestion)
+            bonds_match = re.search(r'債券[：:]\s*(\d+)%', portfolio_suggestion)
+            cash_match = re.search(r'現金[：:]\s*(\d+)%', portfolio_suggestion)
+            other_match = re.search(r'(其他|另類資產|黃金|房地產)[：:]\s*(\d+)%', portfolio_suggestion)
+            
+            stocks = int(stocks_match.group(1)) if stocks_match else 60
+            bonds = int(bonds_match.group(1)) if bonds_match else 30
+            cash = int(cash_match.group(1)) if cash_match else 10
+            other = int(other_match.group(2)) if other_match else 0
+            
+            # 確保總和為100%
+            total = stocks + bonds + cash + other
+            if total != 100:
+                # 調整比例
+                factor = 100 / total
+                stocks = int(stocks * factor)
+                bonds = int(bonds * factor)
+                cash = int(cash * factor)
+                other = 100 - stocks - bonds - cash
+            
+            # 創建餅圖
+            labels = ['股票', '債券', '現金']
+            values = [stocks, bonds, cash]
+            colors = ['#0066ff', '#00cc88', '#ffcc00']
+            
+            if other > 0:
+                labels.append('其他資產')
+                values.append(other)
+                colors.append('#ff6b6b')
+            
+            fig = px.pie(
+                values=values,
+                names=labels,
+                color_discrete_sequence=colors,
+                title=f"投資組合配置 - {risk_level}風險"
+            )
+            
+            fig.update_layout(
+                template='plotly_dark',
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='white'),
+                margin=dict(l=50, r=50, t=80, b=50),
+            )
+            
+            # 生成唯一的文件名
+            chart_id = secrets.token_hex(8)
+            chart_path = f"static/charts/portfolio_{chart_id}.html"
+            fig.write_html(chart_path)
+            
+            return jsonify({
+                'success': True,
+                'suggestion': portfolio_suggestion,
+                'chart_path': chart_path,
+                'allocation': {
+                    'stocks': stocks,
+                    'bonds': bonds,
+                    'cash': cash,
+                    'other': other
+                }
+            })
+        except Exception as chart_error:
+            logging.error(f"生成投資組合圖表時發生錯誤: {chart_error}")
+            # 即使圖表生成失敗，仍返回文字建議
+            return jsonify({
+                'success': True,
+                'suggestion': portfolio_suggestion,
+                'chart_error': str(chart_error)
+            })
+    except Exception as e:
+        logging.error(f"優化投資組合時發生錯誤: {e}")
+        return jsonify({'error': f"優化投資組合時發生錯誤: {str(e)}"}), 500
+
+@app.route('/api/settings', methods=['GET'])
+def get_settings():
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': '無法連接資料庫'}), 500
+            
+        cursor = conn.cursor(dictionary=True)
+        
+        # 暫時使用固定user_id=1，未來應整合登入系統
+        user_id = 1
+        
+        cursor.execute('''
+            SELECT dark_mode, font_size, price_alert, market_summary, data_source
+            FROM settings WHERE user_id = %s
+        ''', (user_id,))
+        
+        settings = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        # 如果沒有設定，使用預設值
+        if not settings:
+            settings = {
+                'dark_mode': True,
+                'font_size': 'medium',
+                'price_alert': False,
+                'market_summary': True,
+                'data_source': 'default'
+            }
+        
+        return jsonify({'settings': settings})
+    except Exception as e:
+        logging.error(f"獲取設定時發生錯誤: {e}")
+        return jsonify({'error': f"獲取設定時發生錯誤: {str(e)}"}), 500
+
+@app.route('/api/settings', methods=['POST'])
+def update_settings():
+    try:
+        data = request.get_json()
+        
+        # 驗證設定
+        if not isinstance(data.get('dark_mode'), bool) or \
+           not data.get('font_size') in ['small', 'medium', 'large'] or \
+           not isinstance(data.get('price_alert'), bool) or \
+           not isinstance(data.get('market_summary'), bool) or \
+           not data.get('data_source') in ['default', 'yahoo', 'alpha']:
+            return jsonify({'error': '無效的設定值'}), 400
+        
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': '無法連接資料庫'}), 500
+            
+        cursor = conn.cursor()
+        
+        # 暫時使用固定user_id=1，未來應整合登入系統
+        user_id = 1
+        
+        # 檢查用戶是否已有設定
+        cursor.execute('SELECT id FROM settings WHERE user_id = %s', (user_id,))
+        if cursor.fetchone():
+            # 更新現有設定
+            cursor.execute('''
+                UPDATE settings 
+                SET dark_mode = %s, font_size = %s, price_alert = %s, 
+                    market_summary = %s, data_source = %s
+                WHERE user_id = %s
+            ''', (
+                data['dark_mode'], 
+                data['font_size'], 
+                data['price_alert'], 
+                data['market_summary'], 
+                data['data_source'], 
+                user_id
+            ))
+        else:
+            # 創建新設定
+            cursor.execute('''
+                INSERT INTO settings 
+                (user_id, dark_mode, font_size, price_alert, market_summary, data_source)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            ''', (
+                user_id, 
+                data['dark_mode'], 
+                data['font_size'], 
+                data['price_alert'], 
+                data['market_summary'], 
+                data['data_source']
+            ))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({'success': True, 'message': '設定已更新'})
+    except Exception as e:
+        logging.error(f"更新設定時發生錯誤: {e}")
+        return jsonify({'error': f"更新設定時發生錯誤: {str(e)}"}), 500
+
+@app.route('/api/market_news', methods=['GET'])
+def get_market_news():
+    try:
+        market = request.args.get('market', 'TW')
+        category = request.args.get('category', 'general')
+        
+        news_list = fetch_market_news(market, category)
+        
+        return jsonify({'news': news_list})
+    except Exception as e:
+        logging.error(f"獲取市場新聞時發生錯誤: {e}")
+        return jsonify({'error': f"獲取市場新聞時發生錯誤: {str(e)}"}), 500
+
+def fetch_market_news(market, category):
+    """獲取市場新聞"""
+    try:
+        # 設定搜尋關鍵字
+        if market == 'TW':
+            search_term = "台股"
+            if category == 'tech':
+                search_term += " 科技"
+            elif category == 'finance':
+                search_term += " 金融"
+            elif category == 'industry':
+                search_term += " 產業"
+        else:
+            search_term = "US stock market"
+            if category == 'tech':
+                search_term += " tech"
+            elif category == 'finance':
+                search_term += " finance"
+            elif category == 'industry':
+                search_term += " industry"
+                
+        # 使用 Google News RSS
+        rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(search_term)}&hl={'en-US' if market == 'US' else 'zh-TW'}&gl={'US' if market == 'US' else 'TW'}&ceid={'US:en' if market == 'US' else 'TW:zh-Hant'}"
+        
+        feed = feedparser.parse(rss_url)
+        news_list = []
+        
+        sentiment_analyzer = pipeline('sentiment-analysis', model='yiyanghkust/finbert-tone')
+        
+        for entry in feed.entries[:15]:  # 只取前15條新聞
+            try:
+                published_time = dt.datetime(*entry.published_parsed[:6])
+                
+                # 使用 FinBERT 進行情緒分析
+                result = sentiment_analyzer(entry.title)[0]
+                
+                # 提取新聞摘要
+                summary = entry.summary if hasattr(entry, 'summary') else ""
+                # 清理HTML標籤
+                summary = re.sub(r'<[^>]+>', '', summary)
+                summary = summary[:150] + '...' if len(summary) > 150 else summary
+                
+                news_entry = {
+                    'title': entry.title,
+                    'link': entry.link,
+                    'date': published_time.strftime('%Y-%m-%d'),
+                    'source': entry.source.title if hasattr(entry, 'source') else 'Google News',
+                    'summary': summary,
+                    'sentiment': result['label'],
+                    'sentiment_score': result['score']
+                }
+                
+                news_list.append(news_entry)
+            except Exception as inner_e:
+                logging.error(f"處理新聞條目時發生錯誤: {inner_e}")
+                continue
+                
+        return news_list
+    except Exception as e:
+        logging.error(f"獲取市場新聞時發生錯誤: {e}")
+        return []
+
+@app.route('/api/market_summary', methods=['GET'])
+def get_market_summary():
+    try:
+        market = request.args.get('market', 'TW')
+        
+        # 獲取主要指數數據
+        if market == 'TW':
+            indices = ['^TWII', '0050.TW', '0056.TW']
+            index_names = ['台灣加權指數', '元大台灣50', '元大高股息']
+        else:
+            indices = ['^GSPC', '^DJI', '^IXIC', '^VIX']
+            index_names = ['S&P 500', '道瓊工業', '納斯達克', '恐慌指數']
+        
+        market_data = []
+        for i, index in enumerate(indices):
+            try:
+                data = yf.Ticker(index)
+                hist = data.history(period="2d")
+                
+                if not hist.empty and len(hist) >= 2:
+                    current = hist.iloc[-1]
+                    prev = hist.iloc[-2]
+                    
+                    price = current['Close']
+                    change = ((current['Close'] - prev['Close']) / prev['Close']) * 100
+                    
+                    market_data.append({
+                        'symbol': index,
+                        'name': index_names[i],
+                        'price': price,
+                        'change': change
+                    })
+            except Exception as inner_e:
+                logging.error(f"獲取指數 {index} 數據時出錯: {inner_e}")
+                market_data.append({
+                    'symbol': index,
+                    'name': index_names[i],
+                    'price': 0,
+                    'change': 0,
+                    'error': True
+                })
+        
+        # 獲取市場新聞摘要
+        news = fetch_market_news(market, 'general')[:5]  # 只取前5條新聞
+        
+        # 獲取市場情緒
+        sentiment_scores = [item['sentiment_score'] for item in news if item['sentiment'] == 'Positive']
+        positive_ratio = len(sentiment_scores) / len(news) if news else 0
+        
+        market_sentiment = "中性"
+        if positive_ratio > 0.6:
+            market_sentiment = "樂觀"
+        elif positive_ratio < 0.4:
+            market_sentiment = "謹慎"
+        
+        return jsonify({
+            'market': market,
+            'indices': market_data,
+            'news': news,
+            'sentiment': market_sentiment,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
+    except Exception as e:
+        logging.error(f"獲取市場摘要時發生錯誤: {e}")
+        return jsonify({'error': f"獲取市場摘要時發生錯誤: {str(e)}"}), 500
+
+@app.route('/static/charts/<path:filename>')
+def serve_chart(filename):
+    return send_from_directory('static/charts', filename)
+
+@app.route('/static/data/<path:filename>')
+def serve_data(filename):
+    return send_from_directory('static/data', filename)
+
+# ------------------ 主程式 ------------------
+
+if __name__ == '__main__':
+    # 初始化資料庫
+    init_database()
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+
